@@ -2,11 +2,17 @@
 
 An interactive, incremental explainer of machine listening: from air pressure to the last layer of a language model, and what each stage loses along the way.
 
+[![Deploy with Vercel](https://vercel.com/button)](https://vercel.com/new/clone?repository-url=https%3A%2F%2Fgithub.com%2FArchdiner%2Fascii-sharks&project-name=how-computers-listen&repository-name=how-computers-listen)
+
 ```sh
 npm install
 npm run dev      # http://localhost:5173
 npm run build    # static site in dist/
 ```
+
+## Deploy
+
+Click **Deploy with Vercel** above, or import this repo at [vercel.com/new](https://vercel.com/new). `vercel.json` sets the Vite build, output to `dist/`, and a `Permissions-Policy` header that allows the microphone. Vercel serves HTTPS, which browsers require for mic access.
 
 ## The course
 
