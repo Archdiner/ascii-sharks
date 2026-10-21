@@ -1,355 +1,353 @@
 import type { Lesson } from "../types";
-import { el, surface, loop, PALETTE, label, roundRect, slider, segmented, button, controls } from "../ui/dom";
+import { slider, segmented, toggle, button, el } from "../ui/dom";
+import { bus } from "../scene/bus";
+import { selfAttention, codecCodes, CODEC_K, cached, type Analysis } from "../analysis";
+import { audio } from "../audio/engine";
+import { SPECIMENS } from "../audio/specimens";
 import { rng } from "../dsp/rand";
-import { stat } from "./capture";
-import { mel16, toyCodec } from "./shared";
+import { S, head, unit, screenText, heat, blit, rampCss, fmtN, partial, decodeFrames } from "./kit";
 
-// ---------------------------------------------------------------- 11 · LM layers
+export function softmax(logits: number[], temp = 1) {
+  const m = Math.max(...logits);
+  const e = logits.map((l) => Math.exp((l - m) / temp));
+  const z = e.reduce((a, b) => a + b, 0);
+  return e.map((v) => v / z);
+}
 
-const QUESTION = ["What", "do", "you", "hear", "?", "▸", "A"];
+/** Keep the most likely entries until they cover p of the probability. */
+export function nucleus(p: number[], topP: number) {
+  const order = [...p.keys()].sort((a, b) => p[b] - p[a]);
+  const keep = new Set<number>();
+  let c = 0;
+  for (const i of order) { if (c >= topP && keep.size) break; keep.add(i); c += p[i]; }
+  return keep;
+}
 
-export const layers: Lesson = {
-  id: "layers",
-  title: "Inside the language model",
+const entropy = (p: number[]) => -p.reduce((a, v) => a + (v > 0 ? v * Math.log2(v) : 0), 0);
+
+// ---------------------------------------------------------------- 11 · attention
+
+function lmTokens(a: Analysis, pool: number) {
+  return cached(`lmtok:${a.clip.id}:${a.enc.T}:${pool}`, () => {
+    const last = a.enc.layers[a.enc.layers.length - 1];
+    // pool like the projector, then cap at 40 tokens so every one stays visible
+    const k = Math.max(pool, Math.ceil(last.length / 40));
+    const out: Float32Array[] = [], loud: number[] = [];
+    const mel = a.mel.frames;
+    for (let i = 0; i < last.length; i += k) {
+      const v = new Float32Array(last[0].length);
+      const end = Math.min(last.length, i + k);
+      for (let j = i; j < end; j++) for (let d = 0; d < v.length; d++) v[d] += last[j][d] / (end - i);
+      out.push(v);
+      const m0 = Math.floor((i / last.length) * mel.length), m1 = Math.max(m0 + 1, Math.floor((end / last.length) * mel.length));
+      let s = 0; for (let j = m0; j < m1 && j < mel.length; j++) for (const x of mel[j]) s += x;
+      loud.push(s / ((m1 - m0) * mel[0].length));
+    }
+    const lo = Math.min(...loud), hi = Math.max(...loud);
+    return { vecs: out, loud: loud.map((v) => (v - lo) / (hi - lo || 1)), k };
+  });
+}
+
+export const attention: Lesson = {
+  id: "attention",
+  short: "Attention",
+  title: "Attention: how tokens read each other",
   chapter: "Understand",
-  blurb: "Audio tokens and text tokens sit in one sequence. Dozens of transformer layers let every token look back at every earlier one, and gradually the sound turns into meaning.",
-  rail: [8],
-  rate: { value: "25 tok/s", note: "× 28 layers × 3584-d" },
-  tabs: {
-    overview: `
-      <p class="lead">Inside the LM, audio tokens are just more tokens.</p>
-      <p>Each <b>transformer block</b> does two things. <b>Self-attention</b> lets each position gather information from earlier positions, weighted by relevance. An <b>MLP</b> then transforms each position on its own. Both <i>add</i> to a running vector per token, the <b>residual stream</b>.</p>
-      <p>A 7B model has about 28–32 of these blocks. Over the layers, a position stops representing "a bright, noisy 40 ms" and starts representing "a dog bark", "the speaker sounds annoyed" or "the word <i>tomorrow</i>".</p>
-      <p><b>Hover a token</b> to see where it attends, and drag <b>Layer</b> to see the pattern change with depth.</p>`,
-    hood: `
-      <p><b>This panel is an illustration.</b> The token row uses your clip (audio tokens are coloured by its real loudness at 25 Hz), but the attention patterns are drawn from what interpretability work typically finds, not computed from a trained model:</p>
-      <ul>
-        <li><b>Early layers</b>: mostly local, each token looks at its neighbours.</li>
-        <li><b>Middle layers</b>: text tokens reach into the audio span, concentrating on the loud, informative parts.</li>
-        <li><b>Late layers</b>: sparse, specific links, such as the answer token attending to the question word and a few key audio moments.</li>
-      </ul>
-      <p>Attention is <b>causal</b>: a token can only see the past. That's why audio goes <i>before</i> the question in the prompt.</p>`,
-    lost: `
-      <p class="lostline"><b>Whatever the question doesn't ask about.</b> The LM pulls from the audio what helps predict the next text token. If the training data were mostly transcripts, the cheapest thing to learn is "find the words". Tone, rhythm and background can stay in the residual stream and never be read out.</p>
-      <p>Audio-reasoning benchmarks (MMAU, AIR-Bench and others) keep finding the same gap: models that transcribe well still fall far short of people on questions about non-speech sound, such as counting events, ordering them, or judging pitch, distance or rhythm.</p>`,
-    specs: [
-      ["Block", "x + Attn(LN(x)); x + MLP(LN(x))"],
-      ["Qwen2-7B", "28 layers · 3584-d · 28 heads"],
-      ["Helium (Moshi)", "7B · 32 layers · 4096-d"],
-      ["Context", "8k – 128k tokens"],
-      ["Attention", "causal, rotary positions"],
-    ],
-  },
-  code: `import torch
-from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor
+  thumb: ["lm"],
+  focus: ["lm"],
+  view: { fill: 0.74, offset: [0, 0.03] },
+  callouts: [
+    { at: "lm.base", icon: "cube", title: "Tokens go in", text: "Your sound's tokens first, then the text of the question.", slot: "bl" },
+    { at: "lm.mid", icon: "tower", title: "One layer", text: "Attention, then a small network. Qwen2-7B stacks 28 of these.", slot: "br" },
+    { at: "lm.screen", icon: "arcs", title: "Attention weights", text: "Arcs show which tokens the chosen token reads from. Thicker means more.", slot: "tl" },
+    { at: "lm.top", icon: "screen", title: "To the head", text: "The last token's final vector decides the next output.", slot: "tr" },
+  ],
+  summary: "Inside the language model, audio tokens are handled like any other tokens. In each of its dozens of layers, every token looks at the tokens before it and pulls in what's relevant. That operation is <b>attention</b>. Here it runs on your sound's tokens, and you can change how it focuses.",
+  steps: [
+    "Each token's vector is turned into three vectors: a <b>query</b> (what this token is looking for), a <b>key</b> (what it contains) and a <b>value</b> (what it passes on). A trained model makes these with learned weights.",
+    "The chosen token's query is compared with every token's key using a <b>dot product</b>: multiply matching numbers and add them up. A higher score means a better match.",
+    "<b>Softmax</b> turns the scores into weights between 0 and 1 that add up to 1. Dividing the scores first by a temperature sets how sharply it focuses: that's the Sharpness slider.",
+    "The token's new vector is the weighted average of the values. A token that attends to a loud bird call now carries information about that call.",
+    "In a language model a token may only look backwards. Future tokens are hidden, which is called a <b>causal mask</b>. That's why the audio goes before the question in the prompt.",
+    "A real model repeats this in about 28 layers, each with many attention \"heads\" side by side, and runs a small network after each. <b>On this page</b> there's one head, and query, key and value are the encoder's output itself: real attention arithmetic, without learned weights. Because a token always matches itself best when query and key are the same, the token itself is masked out, so you see what it takes from the others.",
+  ],
+  lost: `<ul>
+    <li><b>Whatever the question doesn't ask about.</b> The model pulls from the audio what helps predict the next word of its answer. If training was mostly transcription, the easiest thing to learn is to find the words, and tone, rhythm and background can sit unused in the vectors.</li>
+  </ul>
+  <p>Audio-reasoning benchmarks (MMAU, AIR-Bench and others) keep finding that gap: models that transcribe well still fall well short of people on questions about non-speech sound, such as counting events, putting them in order, or judging pitch, distance and rhythm.</p>`,
+  words: [
+    ["Query, key, value", "Three vectors made from each token: what it looks for, what it offers to be matched on, and what it passes on."],
+    ["Dot product", "Multiply two vectors number by number and add up the results. Large when they point the same way."],
+    ["Softmax", "Turns a list of scores into probabilities: exponentiate each, then divide by the total."],
+    ["Attention head", "One set of query/key/value weights. Models run many in parallel, each free to look for different things."],
+    ["Causal mask", "Hides later tokens so each token can only use the past."],
+    ["Layer", "One round of attention plus a small network. Models stack dozens."],
+  ],
+  specs: [
+    ["Qwen2-7B", "28 layers, 3,584 wide, 28 query heads"],
+    ["MLP inside each layer", "18,944 wide"],
+    ["Helium 7B (Moshi)", "32 layers, 4,096 wide"],
+    ["Work per token", "≈ 7.6 billion multiply-adds (one per weight)"],
+    ["On this page", "1 head, 48 wide, no learned weights"],
+  ],
+  code: `import torch, torch.nn.functional as F
 
-name = "Qwen/Qwen2-Audio-7B-Instruct"
-proc  = AutoProcessor.from_pretrained(name)
-model = Qwen2AudioForConditionalGeneration.from_pretrained(name)
+def attention(x, Wq, Wk, Wv, causal=True):
+    q, k, v = x @ Wq, x @ Wk, x @ Wv              # (tokens, d) each
+    scores = q @ k.T / k.shape[-1] ** 0.5         # every query against every key
+    if causal:
+        future = torch.triu(torch.ones_like(scores, dtype=torch.bool), 1)
+        scores = scores.masked_fill(future, float("-inf"))
+    weights = F.softmax(scores, dim=-1)           # rows add up to 1
+    return weights @ v, weights
 
-inputs = proc(text=prompt, audios=[audio], sampling_rate=16000,
-              return_tensors="pt")
-out = model(**inputs, output_attentions=True, output_hidden_states=True)
-print(len(out.hidden_states))      # 29 = embeddings + 28 layers
-print(out.attentions[14].shape)    # (1, heads, T, T)`,
+out, w = attention(audio_tokens, Wq, Wk, Wv)
+print(w[-1].topk(3))                             # what the last token reads from`,
+  rate: (p) => ({ value: `${+(1000 / p.hopMs / p.encStride / p.pool).toFixed(1)} tok/s`, note: "through 28 layers" }),
   mount(ctx) {
-    const { root, audio } = ctx;
-    let L = 14, hover = -1;
-    const p = el("div", { class: "panel", style: "flex:1" }, el("span", { class: "panel-title" }, "One sequence, many layers · illustrative attention"));
-    root.append(p);
-    const sTok = stat("Tokens"), sKind = stat("Hovered"), sTop = stat("Attends most to");
-    root.append(controls(slider({ label: "Layer", min: 1, max: 28, value: L, onInput: (v) => (L = v) })), el("div", { class: "stat-row" }, sTok, sKind, sTop));
-    const S = surface(p);
-    const xs: number[] = [];
-    S.canvas.addEventListener("pointermove", (e) => {
-      const r = S.canvas.getBoundingClientRect();
-      const mx = e.clientX - r.left;
-      let best = -1, bd = 20;
-      xs.forEach((x, i) => { if (Math.abs(x - mx) < bd) { bd = Math.abs(x - mx); best = i; } });
-      hover = best;
+    let sharp = 5, causal = true, q = -1;
+    bus.glow.set("lm", 1);
+    const qS = slider({ label: "Token", min: 0, max: 1, step: 0.001, value: 0.85, onInput: (v) => (q = v) });
+    ctx.row("target", "<b>Choose the token that's asking.</b> The arcs on the monitor show which earlier tokens it reads from.", qS);
+    ctx.row("knob", "<b>Sharpness.</b> Low: it spreads its attention almost evenly. High: it locks onto the one or two best matches.",
+      slider({ label: "Sharpness", min: 1, max: 30, value: sharp, onInput: (v) => (sharp = v) }));
+    ctx.row("cut", "<b>Causal mask.</b> Turn it off to let tokens see the future, as an encoder does. Language models keep it on.", toggle("Only look back", causal, (v) => (causal = v)));
+    ctx.row("wave", "Try it on <i>Drum loop</i>: a token on a hit links strongly to the other hits, because they sound alike.");
+    const sN = ctx.stat("Tokens"), sTop = ctx.stat("Reads most from"), sSpread = ctx.stat("Spread");
+    let att: Float32Array[] = [], img: HTMLCanvasElement | null = null, key = "";
+    const compute = () => {
+      const a = ctx.analysis(), t = lmTokens(a, ctx.pipe().pool);
+      const k2 = `${a.clip.id}|${a.enc.T}|${sharp}|${causal}|${t.k}`;
+      if (k2 !== key) {
+        key = k2;
+        att = selfAttention(t.vecs, sharp, causal, true);
+        img = heat(att.map((r) => { let m = 0; for (const v of r) m = Math.max(m, v); return r.map((v) => Math.sqrt(v / (m || 1))); }), att.length);
+      }
+      return t;
+    };
+    // until the slider is moved, ask from the loudest token
+    const queryIndex = (t: { loud: number[]; vecs: Float32Array[] }) => q < 0 ? t.loud.indexOf(Math.max(...t.loud)) : Math.min(t.vecs.length - 1, Math.floor(q * t.vecs.length));
+    const tick = ctx.world.onTick(() => {
+      const t = compute(), n = t.vecs.length;
+      const qi = queryIndex(t);
+      const row = Array.from(att[qi] ?? []);
+      let best = 0; row.forEach((v, j) => { if (j !== qi && v > row[best]) best = j; });
+      const sec = (j: number) => ((j * t.k * ctx.pipe().encStride * ctx.pipe().hopMs) / 1000).toFixed(2);
+      sN.set(String(n));
+      sTop.set(`${sec(best)} s`);
+      sSpread.set(`≈ ${Math.max(1, 2 ** entropy(row)).toFixed(1)} tokens`);
     });
-    S.canvas.addEventListener("pointerleave", () => (hover = -1));
-    const stop = loop((t) => {
-      const { g, w, h } = S;
-      g.clearRect(0, 0, w, h);
-      // 25 Hz loudness of the clip → up to 24 audio tokens
-      const m = mel16(audio).frames;
-      const nA = Math.min(24, Math.max(6, Math.round(audio.duration * 25 / 4)));
-      const energy = Array.from({ length: nA }, (_, i) => {
-        const a = Math.floor((i * m.length) / nA), b = Math.floor(((i + 1) * m.length) / nA);
-        let s = 0; for (let j = a; j < b; j++) for (const v of m[j]) s += v;
-        return s / Math.max(1, (b - a) * 80);
-      });
-      const emn = Math.min(...energy), emx = Math.max(...energy);
-      const en = energy.map((e) => (e - emn) / (emx - emn || 1));
-      const toks: { s: string; kind: "a" | "t" | "m"; e: number }[] = [{ s: "<audio>", kind: "m", e: 0 }, ...en.map((e) => ({ s: "", kind: "a" as const, e })), { s: "</audio>", kind: "m", e: 0 }, ...QUESTION.map((s) => ({ s, kind: "t" as const, e: 0 }))];
-      const n = toks.length;
-      const x0 = 24, ww = w - 48, step = ww / n;
-      xs.length = 0;
-      for (let i = 0; i < n; i++) xs.push(x0 + (i + 0.5) * step);
-      // layer stack
-      const stackTop = 40, stackH = h - 150;
-      const nShow = 7;
-      for (let k = 0; k < nShow; k++) {
-        const y = stackTop + (k / nShow) * stackH;
-        const layerNum = Math.round(28 - (k / (nShow - 1)) * 27);
-        const on = Math.abs(layerNum - L) <= 2;
-        roundRect(g, x0 - 6, y, ww + 12, stackH / nShow - 6, 6);
-        g.fillStyle = on ? "#1aa3a118" : "#efe3d155"; g.fill();
-        g.strokeStyle = on ? PALETTE.teal : PALETTE.lineSoft; g.lineWidth = 1.2; g.stroke();
-        label(g, `L${layerNum}`, x0 - 2, y + 13, { size: 10, mono: true, color: on ? PALETTE.tealDeep : PALETTE.faint, weight: 400 });
+    ctx.screen("lm", (g, w, h) => {
+      const u = unit(h), t = compute(), n = t.vecs.length;
+      const qi = queryIndex(t);
+      head(g, w, h, `Token ${qi} reads from…`, causal ? "look back only" : "both ways");
+      const x0 = 4 * u, ww = w - 34 * u, ty = 52 * u, cw = ww / n;
+      const row = att[qi] ?? new Float32Array(n);
+      let mx = 0; for (const v of row) mx = Math.max(mx, v);
+      // arcs from the tokens it reads, thickness = weight
+      for (let j = 0; j < n; j++) {
+        if (j === qi || row[j] < mx * 0.04) continue;
+        const a = x0 + (j + 0.5) * cw, b = x0 + (qi + 0.5) * cw, wgt = row[j] / mx;
+        g.strokeStyle = S.teal; g.globalAlpha = 0.25 + 0.75 * wgt; g.lineWidth = (0.3 + 1.4 * wgt) * u;
+        g.beginPath(); g.moveTo(a, ty - 1 * u); g.quadraticCurveTo((a + b) / 2, ty - Math.min(34 * u, Math.abs(b - a) * 0.6 + 6 * u), b, ty - 1 * u); g.stroke();
       }
-      // tokens
-      const ty = h - 96;
-      for (let i = 0; i < n; i++) {
-        const tk = toks[i];
-        const cx = xs[i];
-        const bw = Math.min(step - 3, tk.kind === "a" ? 14 : 60);
-        roundRect(g, cx - bw / 2, ty, bw, 24, 5);
-        g.fillStyle = tk.kind === "a" ? `rgba(26,163,161,${0.3 + 0.7 * tk.e})` : tk.kind === "m" ? "#efe3d1" : "#fdf9f1";
-        g.fill();
-        if (i === hover) { g.strokeStyle = PALETTE.orange; g.lineWidth = 2; g.stroke(); }
-        else if (tk.kind === "t") { g.strokeStyle = PALETTE.line; g.lineWidth = 1; g.stroke(); }
-        if (tk.s) label(g, tk.s.length * 6 > bw ? tk.s.slice(0, 2) : tk.s, cx, ty + 16, { align: "center", size: 11, mono: true, color: PALETTE.navy, weight: 500 });
-      }
-      label(g, "audio tokens (brightness = loudness of your clip)", x0, ty + 42, { size: 10.5, color: PALETTE.tealDeep, weight: 600 });
-      label(g, "text", xs[n - QUESTION.length], ty + 42, { size: 10.5, color: PALETTE.muted, weight: 600 });
-      // attention from query q to earlier tokens
-      const q = hover >= 0 ? hover : n - 1 - (Math.floor(t * 0.4) % 3);
-      const depth = (L - 1) / 27;
-      const wts: number[] = [];
-      const r = rng(q * 97 + L);
-      for (let j = 0; j <= q; j++) {
-        const dist = q - j;
-        const local = Math.exp(-dist / 1.5);
-        const audioPull = toks[j].kind === "a" && toks[q].kind !== "a" ? 0.2 + toks[j].e ** 2 : 0.05;
-        const sparse = (toks[j].s === "hear" || (toks[j].kind === "a" && toks[j].e > 0.85)) && toks[q].kind === "t" ? 1.5 : r() < 0.05 ? 0.6 : 0;
-        const wgt = local * (1 - depth) ** 2 * 2 + audioPull * Math.sin(Math.PI * Math.min(1, depth * 1.2)) * 1.6 + sparse * depth ** 2 * 2;
-        wts.push(wgt);
-      }
-      const sum = wts.reduce((a, b) => a + b, 0) || 1;
-      const arcTop = stackTop + stackH * (1 - (L - 1) / 27) * 0.85 + 8;
-      let bestJ = 0;
-      wts.forEach((wv, j) => {
-        const a = wv / sum;
-        if (a > wts[bestJ] / sum) bestJ = j;
-        if (a < 0.01 || j === q) return;
-        const x1 = xs[j], x2 = xs[q];
-        g.strokeStyle = PALETTE.teal; g.globalAlpha = Math.min(1, a * 4); g.lineWidth = 1 + a * 10;
-        g.beginPath(); g.moveTo(x1, ty - 2); g.quadraticCurveTo((x1 + x2) / 2, Math.max(arcTop, ty - 20 - (x2 - x1) * 0.55), x2, ty - 2); g.stroke();
-      });
       g.globalAlpha = 1;
-      sTok.set(`${en.length} audio + ${QUESTION.length + 2}`);
-      sKind.set(toks[q].kind === "a" ? `audio #${q}` : `"${toks[q].s}"`);
-      sTop.set(toks[bestJ].kind === "a" ? `audio #${bestJ}` : `"${toks[bestJ].s}"`);
+      // the tokens, brightness = loudness
+      for (let j = 0; j < n; j++) {
+        g.fillStyle = j === qi ? S.orange : rampCss(0.25 + 0.7 * t.loud[j]);
+        g.fillRect(x0 + j * cw + 0.2 * u, ty, cw - 0.4 * u, 6 * u);
+      }
+      // weights as bars under each token
+      const by = 62 * u, bh = 26 * u;
+      for (let j = 0; j < n; j++) {
+        const v = row[j] / (mx || 1);
+        g.fillStyle = j === qi ? S.orange : S.teal;
+        g.fillRect(x0 + j * cw + 0.3 * u, by, cw - 0.6 * u, v * bh);
+      }
+      screenText(g, "↑ audio tokens (brightness = loudness)     ↓ how much the orange token reads from each", x0, 96 * u, 4.2 * u, S.dim);
+      if (img) blit(g, img, w - 28 * u, 16 * u, 24 * u, 24 * u, false);
+      screenText(g, "all rows", w - 28 * u, 45 * u, 4 * u, S.dim);
     });
-    return () => { stop(); S.dispose(); };
+    return () => { tick(); bus.glow.delete("lm"); };
   },
   run(ctx) {
-    const d = ctx.audio.duration;
-    const T = Math.round(d * 25) + 12;
-    ctx.log(`sequence: ${Math.round(d * 25)} audio + 12 text = ${T} tokens`);
-    const dm = 3584, L = 28, ff = 18944;
-    const perTok = L * (4 * dm * dm + 3 * dm * ff) * 2;
-    ctx.log(`≈ ${(perTok / 1e9).toFixed(1)} GFLOPs per token (28 layers, d=${dm}, MLP ${ff})`);
-    ctx.log(`attention scores per layer per head: ${T}² = ${(T * T).toLocaleString()}`);
-    ctx.log(`whole forward pass ≈ ${((perTok * T) / 1e12).toFixed(2)} TFLOPs for your ${d.toFixed(1)} s clip`, "ok");
+    const a = ctx.analysis(), t = lmTokens(a, ctx.pipe().pool), n = t.vecs.length;
+    ctx.log(`${n} tokens from "${a.clip.name}"`);
+    for (const s of [2, 5, 20]) {
+      const w = selfAttention(t.vecs, s, true, true)[n - 1];
+      const top = [...w.keys()].sort((x, y) => w[y] - w[x]).slice(0, 3);
+      ctx.log(`sharpness ${String(s).padStart(2)}: last token → ${top.map((j) => `#${j} (${(w[j] * 100).toFixed(0)}%)`).join(", ")}, spread ≈ ${(2 ** entropy(Array.from(w))).toFixed(1)} tokens`);
+    }
+    ctx.log("Higher sharpness concentrates the weights on fewer tokens.", "ok");
   },
 };
 
 // ---------------------------------------------------------------- 12 · LM head
 
-const STORIES: Record<string, string[][]> = {
-  voice: [["A", "Someone", "The", "It"], ["voice", "person", "singer", "synth"], ["singing", "saying", "humming", "making"], ["three", "long", "the", "open"], ["vowels", "notes", "sounds", "tones"], [":", ",", ".", "—"], ["ah", "a", "oh", "eh"], [",", "…", "-", "."], ["ee", "i", "eh", "e"], [",", "and", "then", "."], ["oo", "u", "oh", "o"], [".", "!", "…", ","]],
-  chord: [["A", "Some", "The", "Piano"], ["piano", "major", "bright", "single"], ["chord", "arpeggio", "note", "melody"], [",", "in", "being", "that"], ["C", "probably", "rolled", "struck"], ["major", "maj", "chord", "triad"], [".", ",", "!", "…"]],
-  birds: [["Birds", "A", "Some", "High"], ["chirping", "singing", "tweeting", "calling"], ["outside", "in", "rapidly", "high"], [".", ",", "!", "…"]],
-  drums: [["A", "Some", "The", "Drum"], ["drum", "beat", "rock", "simple"], ["beat", "loop", "pattern", "groove"], ["at", "around", "with", ","], ["120", "about", "a", "medium"], ["bpm", "BPM", "tempo", "beats"], [".", ",", "!", "…"]],
-  rain: [["Rain", "Steady", "Heavy", "Water"], ["falling", "on", "pattering", "hitting"], ["on", "against", "outside", "onto"], ["a", "the", "some", "metal"], ["roof", "window", "surface", "street"], [".", ",", "…", "!"]],
-  pingpong: [["A", "Notes", "Tones", "Marimba"], ["marimba", "bell", "melody", "xylophone"], ["bouncing", "panning", "alternating", "moving"], ["left", "between", "side", "across"], ["and", "to", "&", ","], ["right", "left", "back", "speakers"], [".", ",", "!", "…"]],
-  sweep: [["A", "The", "One", "Rising"], ["tone", "sine", "test", "pitch"], ["sweeping", "rising", "gliding", "going"], ["upward", "up", "from", "higher"], ["in", "through", "across", "over"], ["pitch", "frequency", "tone", "range"], [".", ",", "!", "…"]],
-  other: [["This", "It", "Someone", "A"], ["sounds", "is", "seems", "recording"], ["like", "to", "as", "of"], ["a", "someone", "speech", "people"], ["person", "voice", "recording", "room"], ["speaking", "talking", "nearby", "."], [".", ",", "!", "…"]],
-};
+type Mode = "labels" | "audio";
 
-type HeadMode = "text" | "audio";
+/** A next-code model over codebook 1, trained on every built-in sound: an audio "language model" in miniature. */
+function bigram() {
+  return cached("bigram", () => {
+    const K = CODEC_K;
+    const counts = Array.from({ length: K }, () => new Float64Array(K).fill(0.05));
+    const columns: number[][][] = Array.from({ length: K }, () => []);
+    for (const s of SPECIMENS) {
+      const c = codecCodes(audio.specimen(s.id));
+      for (let i = 0; i < c.codes[0].length; i++) {
+        if (i > 0) counts[c.codes[0][i - 1]][c.codes[0][i]] += 1;
+        columns[c.codes[0][i]].push(c.codes.map((r) => r[i]));
+      }
+    }
+    return { counts, columns };
+  });
+}
 
-export const head: Lesson = {
+export const headLesson: Lesson = {
   id: "head",
-  title: "The LM head: choosing what comes next",
+  short: "LM head",
+  title: "The LM head: choosing an output",
   chapter: "Understand",
-  blurb: "The last layer's vector is multiplied against every entry in the vocabulary to give one score each. Softmax turns the scores into probabilities, and sampling picks one.",
-  rail: [9],
-  rate: { value: "≈ 50 b/s", note: "≈ 3 words/s × 17 bits" },
-  tabs: {
-    overview: `
-      <p class="lead">The <b>LM head</b> is one big matrix: hidden size × vocabulary size (e.g. 3584 × 151,646).</p>
-      <p>Multiplying the final hidden vector by it gives a <b>logit</b>, a raw score, for every token. <b>Softmax</b> turns those into probabilities that sum to 1. Then the model <b>samples</b>:</p>
-      <ul>
-        <li><b>Temperature</b> divides the logits first. Below 1 sharpens the distribution toward the top choice; above 1 flattens it.</li>
-        <li><b>Top-p</b> keeps only the most likely tokens whose probabilities add up to <code>p</code>, and samples from those.</li>
-      </ul>
-      <p>Press <b>Sample</b> repeatedly to build a caption for your clip. Then switch to <b>Audio head</b>: a speech model's head can output <i>sound tokens</i> too.</p>`,
-    hood: `
-      <p><b>The sampling is real; the scores are made up.</b> Temperature, softmax, top-p and the random draw run exactly as in a real model. The logits come from a small hand-written table per sound, standing in for a real 7B model.</p>
-      <p>A model that <b>speaks</b> has an output vocabulary that includes audio codes, and it predicts a codec frame instead of a word. With 8 RVQ codebooks per frame, that's 8 predictions per 80 ms. Moshi's <b>Depth Transformer</b> makes those 8 predictions one after another, each conditioned on the previous ones (next lesson).</p>
-      <p>The codec decoder (Mimi's, here) turns the predicted codes back into a waveform.</p>`,
-    lost: `
-      <p class="lostline"><b>Everything that isn't the next token.</b> The head reduces a 3,584-dimensional understanding of the audio to a single choice. The answer is the bottleneck: if the vocabulary has no good way to say it, or the training never rewarded saying it, it doesn't get said.</p>
-      <p>The output rate is tiny. A caption at ~3 tokens/s carries about 50 bits/s, where we started at 2.3 million.</p>`,
-    specs: [
-      ["Qwen2 vocab", "151,646 tokens"],
-      ["Llama-3 vocab", "128,256 tokens"],
-      ["Head", "Linear(d_model → V), often tied"],
-      ["Moshi text vocab", "32,000"],
-      ["Mimi audio vocab", "2048 per codebook × 8"],
-    ],
-  },
+  thumb: ["head"],
+  focus: ["head"],
+  view: { fill: 0.74, offset: [0, 0.03] },
+  callouts: [
+    { at: "head.screen", icon: "bars", title: "One score per output", text: "Every possible output gets a score. Softmax turns the scores into probabilities.", slot: "tl" },
+    { at: "head.bars", icon: "target", title: "The pick", text: "Temperature and top-p decide how adventurous the choice is.", slot: "bl" },
+    { at: "lm.top", icon: "tower", title: "From the last layer", text: "The final vector of the last token is what gets scored.", slot: "tr" },
+  ],
+  summary: "The model's last step, the <b>LM head</b>, gives every possible output a score: every word in its vocabulary, or every audio code. <b>Softmax</b> turns the scores into probabilities and the model picks one. Here the head is small enough to inspect, with one row per kind of sound.",
+  steps: [
+    "The head is one big table of numbers with a row for every possible output: 151,646 rows for Qwen2's vocabulary.",
+    "Each row is compared with the final vector by a dot product. The result is that output's score, called a <b>logit</b>.",
+    "Divide the logits by the <b>temperature</b>, then apply softmax to get probabilities that add up to 1. Low temperature makes the top choice dominate; high temperature evens them out.",
+    "<b>Top-p</b> keeps only the most likely outputs until their probabilities add up to p, and discards the long tail of unlikely ones.",
+    "Pick one at random according to those probabilities. Add it to the sequence and run the model again for the next token. This one-at-a-time generation is called <b>autoregressive</b>.",
+    "<b>Labels mode:</b> the rows are the average features of the seven built-in sounds, and the input is the current sound's average features, so the scores are computed from your sound. <b>Audio mode:</b> the outputs are codec numbers, and a small model trained on how those numbers follow each other generates new sound.",
+  ],
+  lost: `<ul>
+    <li><b>Everything that isn't the chosen output.</b> A rich internal description becomes one token at a time. If the vocabulary has no good word for something, or training never rewarded saying it, it isn't said.</li>
+    <li><b>Bits:</b> a short caption is about 50 bits per second. The 16 kHz audio was 256,000.</li>
+  </ul>`,
+  words: [
+    ["Logit", "The raw score for one possible output, before softmax."],
+    ["Temperature", "Divides the logits before softmax. Below 1: more predictable. Above 1: more varied."],
+    ["Top-p (nucleus)", "Sample only from the smallest set of outputs whose probabilities add up to p."],
+    ["Vocabulary", "The full list of tokens a model can output."],
+    ["Autoregressive", "Generating one token at a time, each one fed back in to produce the next."],
+    ["Entropy", "How spread out the probabilities are, in bits. 0 means certain."],
+  ],
+  specs: [
+    ["Qwen2 vocabulary", "151,646 tokens"],
+    ["Llama 3 vocabulary", "128,256 tokens"],
+    ["Moshi text vocabulary", "32,000"],
+    ["Mimi audio vocabulary", "2,048 per codebook"],
+    ["On this page", "7 labels · 32 audio codes"],
+  ],
   code: `import torch
 
-h = hidden_states[-1][:, -1]            # (1, 3584) last position
-logits = h @ model.lm_head.weight.T     # (1, 151646)
+h = hidden_states[-1][:, -1]                 # final vector of the last token
+logits = model.lm_head(h)                    # one score per vocabulary entry
 
 def sample(logits, temperature=0.8, top_p=0.9):
-    p = torch.softmax(logits / temperature, -1)
+    p = torch.softmax(logits / temperature, dim=-1)
     sp, idx = p.sort(descending=True)
-    keep = sp.cumsum(-1) - sp < top_p    # nucleus
+    keep = sp.cumsum(-1) - sp < top_p        # smallest set covering top_p
     sp = sp * keep
     return idx[torch.multinomial(sp / sp.sum(), 1)]
 
-next_id = sample(logits)
-print(tokenizer.decode(next_id))`,
+print(tokenizer.decode(sample(logits)))`,
+  rate: () => ({ value: "≈ 50 b/s", note: "a few words per second" }),
   mount(ctx) {
-    const { root, audio } = ctx;
-    let temp = 0.8, topP = 0.9, mode: HeadMode = "text";
-    let out: string[] = [], step = 0, codeOut: number[][] = [];
-    const r = rng(Date.now() % 100000);
-    const row = el("div", { class: "viz-row", style: "flex:1" });
-    const pD = el("div", { class: "panel", style: "flex:1.4" }, el("span", { class: "panel-title" }, "Probabilities after temperature + top-p"));
-    const pO = el("div", { class: "panel", style: "flex:1" }, el("span", { class: "panel-title" }, "Output so far"));
-    row.append(pD, pO);
-    root.append(row);
-    const sEnt = stat("Entropy"), sKept = stat("Tokens kept"), sTop = stat("Top choice");
-    const sampleBtn = button("▶ Sample next", () => doSample(), "btn primary");
-    root.append(controls(
-      segmented<HeadMode>("Head", [["text", "Text head"], ["audio", "Audio head"]], mode, (v) => { mode = v; reset(); }),
-      slider({ label: "Temperature", min: 0.1, max: 2, step: 0.05, value: temp, fmt: (v) => v.toFixed(2), onInput: (v) => (temp = v) }),
-      slider({ label: "Top-p", min: 0.1, max: 1, step: 0.01, value: topP, fmt: (v) => v.toFixed(2), onInput: (v) => (topP = v) }),
-    ), controls(sampleBtn, button("Reset", () => reset(), "btn")), el("div", { class: "stat-row" }, sEnt, sKept, sTop));
-    const D = surface(pD), O = surface(pO);
-    const story = () => STORIES[audio.clip.source === "specimen" ? audio.clip.id : "other"];
-    const reset = () => { out = []; step = 0; codeOut = []; };
-    const off = audio.on(reset);
-    // text logits: candidate 0 is the "model's" favourite, then decreasing
-    const textLogits = () => {
-      const s = story();
-      const cands = s[Math.min(step, s.length - 1)];
-      return cands.map((tok, i) => ({ tok, logit: 4 - i * 1.3 + (i === 0 ? 0.5 : 0) })).concat([{ tok: "the", logit: 0.2 }, { tok: "music", logit: -0.4 }, { tok: "noise", logit: -0.6 }, { tok: "<eos>", logit: step >= s.length ? 6 : -1.5 }]);
+    let mode: Mode = "labels", temp = 1, topP = 0.9;
+    const r = rng(Date.now() % 9973);
+    let picks: string[] = [], gen: number[] = [];
+    ctx.row("split", "<b>What the head chooses between.</b>",
+      segmented<Mode>("Outputs", [["labels", "Sound labels"], ["audio", "Audio codes"]], mode, (v) => { mode = v; actions.replaceChildren(v === "labels" ? sampleBtn : genBtn); }));
+    ctx.row("knob", "<b>Temperature.</b> In audio mode, low values loop the same few sounds and high values jump around at random.",
+      slider({ label: "Temperature", min: 0.1, max: 2.5, step: 0.05, value: temp, fmt: (v) => v.toFixed(2), onInput: (v) => (temp = v) }));
+    ctx.row("filter", "<b>Top-p.</b> Lower it to cut off unlikely outputs completely.",
+      slider({ label: "Top-p", min: 0.1, max: 1, step: 0.01, value: topP, fmt: (v) => v.toFixed(2), onInput: (v) => (topP = v) }));
+    const labelDist = () => { const L = ctx.analysis().labels; return { names: L.map((l) => l.name), p: softmax(L.map((l) => l.logit), temp) }; };
+    const sampleBtn = button("▶ Pick one", () => {
+      const { names, p } = labelDist(), keep = nucleus(p, topP);
+      const z = [...keep].reduce((a, i) => a + p[i], 0);
+      let u = r() * z, pick = [...keep][0];
+      for (const i of keep) { u -= p[i]; if (u <= 0) { pick = i; break; } }
+      picks = [...picks.slice(-5), names[pick]];
+      ctx.log(`picked "${names[pick]}" (p = ${p[pick].toFixed(3)})`, "dim");
+    }, "btn primary");
+    const genBtn = button("▶ Generate 3 s and hear it", () => {
+      const { counts, columns } = bigram();
+      const c = codecCodes(ctx.audio.clip);
+      let cur = c.codes[0][0];
+      gen = [cur];
+      for (let i = 1; i < 38; i++) {
+        const p = softmax(Array.from(counts[cur], (v) => Math.log(v)), temp), keep = nucleus(p, topP);
+        const z = [...keep].reduce((a, j) => a + p[j], 0);
+        let u = r() * z;
+        for (const j of keep) { u -= p[j]; if (u <= 0) { cur = j; break; } }
+        gen.push(cur);
+      }
+      // fill codebooks 2–8 by borrowing a real column that starts with the same first code
+      const cols = gen.map((g) => { const opts = columns[g]; return opts.length ? opts[Math.floor(r() * opts.length)] : [g, 0, 0, 0, 0, 0, 0, 0]; });
+      const fake = { frames: cols.map(() => new Float32Array(80)), codes: Array.from({ length: 8 }, (_, s) => cols.map((col) => col[s])), recon: [] as Float32Array<ArrayBuffer>[] };
+      const frames = cols.map((_, i) => partial(fake, i, 8));
+      ctx.log(`generated ${gen.length} frames (codebook 1): ${gen.slice(0, 16).join(" ")} …`, "dim");
+      setTimeout(() => ctx.audio.playSignal([decodeFrames(frames)], 16000), 30);
+    }, "btn primary");
+    const actions = el("div", { class: "btns" }, sampleBtn);
+    ctx.row("play", "<b>Pick.</b> In labels mode the model names the sound. In audio mode it writes 3 seconds of new codes, starting from your sound's first frame, and plays them.", actions);
+    const sTop = ctx.stat("Top choice"), sP = ctx.stat("Its probability"), sH = ctx.stat("Entropy"), sK = ctx.stat("Kept by top-p");
+    const nextCode = () => {
+      const { counts } = bigram(), c = codecCodes(ctx.audio.clip);
+      const f = ctx.audio.position() >= 0 ? Math.min(c.codes[0].length - 1, Math.floor((ctx.audio.position() / ctx.audio.duration) * c.codes[0].length)) : 0;
+      const cur = gen.length ? gen[gen.length - 1] : c.codes[0][f];
+      return { cur, p: softmax(Array.from(counts[cur], (v) => Math.log(v)), temp) };
     };
-    // audio logits: peaks around the toy codec's real code for this frame
-    const audioLogits = () => {
-      const c = toyCodec(audio, 64);
-      const frame = Math.min(c.q.codes[0].length - 1, codeOut.length * 10);
-      const cb = (codeOut.at(-1)?.length ?? 8) % 8;
-      const real = c.q.codes[Math.min(cb, c.q.codes.length - 1)][frame] * 32 + 7;
-      const L = new Float32Array(2048);
-      const rr = rng(frame * 13 + cb);
-      for (let i = 0; i < 2048; i++) L[i] = -2 + rr() * 1.5 + 6 * Math.exp(-(((i - real) / 12) ** 2)) + 3 * Math.exp(-(((i - ((real * 7) % 2048)) / 30) ** 2));
-      return Array.from(L, (logit, i) => ({ tok: String(i), logit }));
-    };
-    function dist() {
-      const L = mode === "text" ? textLogits() : audioLogits();
-      const mx = Math.max(...L.map((x) => x.logit));
-      const ex = L.map((x) => Math.exp((x.logit - mx) / temp));
-      const z = ex.reduce((a, b) => a + b, 0);
-      const probs = L.map((x, i) => ({ tok: x.tok, p: ex[i] / z }));
-      const sorted = [...probs].sort((a, b) => b.p - a.p);
-      let cum = 0;
-      const kept = new Set<string>();
-      for (const x of sorted) { if (cum >= topP && kept.size > 0) break; kept.add(x.tok); cum += x.p; }
-      return { probs, sorted, kept };
-    }
-    function doSample() {
-      const { sorted, kept } = dist();
-      const pool = sorted.filter((x) => kept.has(x.tok));
-      const z = pool.reduce((a, b) => a + b.p, 0);
-      let u = r() * z, pick = pool[0];
-      for (const x of pool) { u -= x.p; if (u <= 0) { pick = x; break; } }
-      if (mode === "text") {
-        if (pick.tok === "<eos>") { ctx.log("<eos>: the model chose to stop.", "dim"); reset(); return; }
-        out.push(pick.tok); step++;
-        ctx.log(`sampled "${pick.tok}" (p = ${pick.p.toFixed(3)})`, "dim");
-        if (step > story().length + 1) reset();
-      } else {
-        if (!codeOut.length || codeOut.at(-1)!.length >= 8) codeOut.push([]);
-        codeOut.at(-1)!.push(Number(pick.tok));
-        if (codeOut.length > 10) codeOut.shift();
-        ctx.log(`frame ${codeOut.length}, codebook ${codeOut.at(-1)!.length}: code ${pick.tok}`, "dim");
-      }
-    }
-    const stop = loop(() => {
-      const { probs, sorted, kept } = dist();
-      {
-        const { g, w, h } = D;
-        g.clearRect(0, 0, w, h);
-        if (mode === "text") {
-          const top = sorted.slice(0, 8);
-          const bh = Math.min(26, (h - 40) / top.length);
-          top.forEach((x, i) => {
-            const y = 30 + i * bh;
-            const on = kept.has(x.tok);
-            label(g, x.tok, 84, y + bh / 2 + 4, { align: "right", size: 12, mono: true, color: on ? PALETTE.navy : PALETTE.faint, weight: 500 });
-            roundRect(g, 92, y + 3, Math.max(2, (w - 160) * x.p), bh - 7, 3);
-            g.fillStyle = !on ? PALETTE.track : i === 0 ? PALETTE.navy : PALETTE.teal; g.fill();
-            label(g, `${(x.p * 100).toFixed(1)}%`, 98 + (w - 160) * x.p, y + bh / 2 + 4, { size: 10.5, mono: true, color: PALETTE.muted, weight: 400 });
-          });
-        } else {
-          const x0 = 16, ww = w - 32, y0 = 30, hh = h - 56;
-          let mx = 0; for (const x of probs) mx = Math.max(mx, x.p);
-          for (let i = 0; i < probs.length; i++) {
-            const v = probs[i].p / mx;
-            g.fillStyle = kept.has(probs[i].tok) ? PALETTE.teal : PALETTE.track;
-            g.fillRect(x0 + (i / 2048) * ww, y0 + hh - v * hh, Math.max(1, ww / 2048), v * hh);
-          }
-          label(g, "codes 0 … 2047", x0, h - 8, { size: 10.5, mono: true, color: PALETTE.faint, weight: 400 });
-        }
-      }
-      {
-        const { g, w, h } = O;
-        g.clearRect(0, 0, w, h);
-        if (mode === "text") {
-          g.font = '500 15px "Barlow", sans-serif';
-          let x = 14, y = 50;
-          label(g, "What do you hear?", 14, 26 + 8, { size: 12.5, color: PALETTE.muted, weight: 500 });
-          for (const wd of out) {
-            const tw = g.measureText(wd + " ").width;
-            if (x + tw > w - 14) { x = 14; y += 24; }
-            g.fillStyle = PALETTE.navy; g.textAlign = "left"; g.textBaseline = "alphabetic"; g.fillText(wd, x, y + 12);
-            x += tw;
-          }
-          g.fillStyle = PALETTE.teal; g.fillRect(x, y - 2, 2, 18);
-        } else {
-          const cw = Math.min(46, (w - 28) / 10), ch = Math.min(18, (h - 50) / 8);
-          for (let f = 0; f < codeOut.length; f++) for (let c = 0; c < codeOut[f].length; c++) {
-            roundRect(g, 14 + f * cw, 32 + c * ch, cw - 3, ch - 3, 3);
-            g.fillStyle = c === 0 ? PALETTE.navy : PALETTE.teal; g.globalAlpha = c === 0 ? 1 : 0.4 + 0.6 * (1 - c / 8); g.fill(); g.globalAlpha = 1;
-            label(g, String(codeOut[f][c]), 14 + f * cw + (cw - 3) / 2, 32 + c * ch + ch / 2 + 2, { align: "center", size: 9, mono: true, color: "#fdf8ef", weight: 500 });
-          }
-          label(g, "each column = 80 ms frame · rows = 8 codebooks", 14, h - 8, { size: 10.5, color: PALETTE.muted, weight: 500 });
-        }
-      }
-      const H = -probs.reduce((a, x) => a + (x.p > 0 ? x.p * Math.log2(x.p) : 0), 0);
-      sEnt.set(`${H.toFixed(2)} bits`);
-      sKept.set(String(kept.size));
-      sTop.set(mode === "text" ? `"${sorted[0].tok}"` : `code ${sorted[0].tok}`);
+    const tick = ctx.world.onTick(() => {
+      const d = mode === "labels" ? labelDist() : { names: [...Array(CODEC_K).keys()].map((i) => `code ${i}`), p: nextCode().p };
+      const best = d.p.indexOf(Math.max(...d.p));
+      sTop.set(d.names[best]); sP.set(`${(d.p[best] * 100).toFixed(1)} %`); sH.set(`${entropy(d.p).toFixed(2)} bits`); sK.set(`${nucleus(d.p, topP).size} of ${d.p.length}`);
     });
-    return () => { stop(); off(); D.dispose(); O.dispose(); };
+    ctx.screen("head", (g, w, h) => {
+      const u = unit(h);
+      if (mode === "labels") {
+        const { names, p } = labelDist(), keep = nucleus(p, topP);
+        head(g, w, h, `What is "${ctx.audio.clip.name}"?`, `T = ${temp.toFixed(2)}`);
+        const order = [...p.keys()].sort((a, b) => p[b] - p[a]);
+        const bh = 8.4 * u, x0 = 30 * u, ww = w * 0.5;
+        order.forEach((i, k) => {
+          const y = (16 + k * 10) * u;
+          screenText(g, names[i], x0 - 2 * u, y + 6 * u, 5.4 * u, keep.has(i) ? S.ink : S.dim, "right");
+          g.fillStyle = !keep.has(i) ? "#2c3a5e" : k === 0 ? S.orange : S.teal;
+          g.fillRect(x0, y, Math.max(0.5 * u, ww * p[i]), bh * 0.8);
+          screenText(g, `${(p[i] * 100).toFixed(1)}%`, x0 + ww * p[i] + 1.5 * u, y + 6 * u, 4.8 * u, S.dim, "left", true);
+        });
+        screenText(g, "picks:", w * 0.83, 22 * u, 5 * u, S.dim, "left");
+        picks.slice(-6).forEach((pk, i) => screenText(g, pk, w * 0.83, (31 + i * 9) * u, 5.4 * u, S.ink, "left"));
+      } else {
+        const { cur, p } = nextCode(), keep = nucleus(p, topP);
+        head(g, w, h, `Next code after ${cur}`, `T = ${temp.toFixed(2)}`);
+        const x0 = 5 * u, ww = w - 10 * u, base = 62 * u, H = 42 * u, bw = ww / p.length;
+        const mx = Math.max(...p);
+        p.forEach((v, i) => { g.fillStyle = keep.has(i) ? (v === mx ? S.orange : S.teal) : "#2c3a5e"; g.fillRect(x0 + i * bw + 0.2 * u, base - (v / mx) * H, bw - 0.4 * u, (v / mx) * H); });
+        screenText(g, `codes 0 – ${p.length - 1}`, x0, base + 6 * u, 4.4 * u, S.dim, "left", true);
+        g.font = S.mono(4.8 * u); g.fillStyle = S.ink; g.textAlign = "left";
+        g.fillText(gen.length ? gen.slice(0, 22).join(" ") : "press Generate", x0, 82 * u);
+        if (gen.length > 22) g.fillText(gen.slice(22, 44).join(" "), x0, 90 * u);
+      }
+    });
+    return () => tick();
   },
   run(ctx) {
-    const L = [3.2, 2.1, 1.0, 0.2, -0.5];
-    ctx.log(`logits ${JSON.stringify(L)}`);
-    for (const T of [0.3, 0.8, 1.5]) {
-      const ex = L.map((l) => Math.exp(l / T)), z = ex.reduce((a, b) => a + b, 0);
-      ctx.log(`T=${T.toFixed(1)}  p = [${ex.map((e) => (e / z).toFixed(3)).join(", ")}]`);
+    const L = ctx.analysis().labels;
+    ctx.log(`logits for "${ctx.audio.clip.name}": ${L.map((l) => `${l.name} ${l.logit.toFixed(2)}`).join(", ")}`);
+    for (const t of [0.3, 1, 2]) {
+      const p = softmax(L.map((l) => l.logit), t);
+      const best = p.indexOf(Math.max(...p));
+      ctx.log(`T=${t.toFixed(1)}: top "${L[best].name}" ${(p[best] * 100).toFixed(0)}%, entropy ${entropy(p).toFixed(2)} bits`);
     }
-    ctx.log("Lower temperature → the top token takes nearly everything.", "ok");
+    ctx.log(`Lower temperature → more certain. ${fmtN(L.length)} rows here; a real vocabulary has over 100,000.`, "ok");
   },
 };

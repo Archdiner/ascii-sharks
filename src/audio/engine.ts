@@ -48,7 +48,7 @@ export class AudioEngine {
       const ctx = new AudioContext({ latencyHint: "interactive" });
       this.ctx = ctx;
       this.analyser = ctx.createAnalyser();
-      this.analyser.fftSize = 4096;
+      this.analyser.fftSize = 2048;
       this.analyser.smoothingTimeConstant = 0;
       this.out = ctx.createGain();
       this.out.connect(ctx.destination);
@@ -208,6 +208,7 @@ export class AudioEngine {
 
   /** Record from the microphone and make the recording the current clip. */
   async record(seconds: number, onTick?: (t: number) => void) {
+    const wasOn = this.micOn;
     await this.startMic();
     this.recording = [];
     const t0 = performance.now();
@@ -220,6 +221,7 @@ export class AudioEngine {
     });
     const parts = this.recording;
     this.recording = null;
+    if (!wasOn) this.stopMic();
     const len = parts.reduce((a, p) => a + p.length, 0);
     const x = new Float32Array(len);
     let o = 0;

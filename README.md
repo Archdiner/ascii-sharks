@@ -16,44 +16,51 @@ Click **Deploy with Vercel** above, or import this repo at [vercel.com/new](http
 
 ## The course
 
-| # | Chapter | Lesson | You can… |
-|---|---------|--------|----------|
-| 1 | Capture | Sound is pressure | drive an air-particle field with a tone or your mic |
-| 2 | Capture | The microphone | watch MEMS / condenser / dynamic capsules follow your voice |
-| 3 | Capture | Sampling | push a tone past Nyquist and hear it alias |
-| 4 | Capture | Quantization | crush bit depth, toggle dither, measure SNR |
-| 5 | Represent | Frames & FFT | drag a 10–100 ms window across the waveform |
-| 6 | Represent | Spectrograms & mel | compare linear / 80-mel / 128-mel, live from the mic |
-| 7 | Represent | Where sound gets lost | stack mono, 16 kHz, phase loss, mel, 80 ms pooling, and listen |
-| 8 | Encode | The audio encoder | run a Whisper-shaped conv stem + attention on your clip |
-| 9 | Encode | From vectors to tokens | train VQ / RVQ codebooks on your clip and hear the decode |
-| 10 | Encode | The projector | see the token budget of pool+MLP, Q-Former and codec tokens |
-| 11 | Understand | Inside the LM | explore (illustrative) attention across layers |
-| 12 | Understand | The LM head | sample with temperature / top-p from text and audio heads |
-| 13 | Codecs | Mimi | 12.5 Hz, split RVQ, semantic distillation, bitrate per codebook |
-| 14 | Codecs | Moshi | step through full-duplex token streams and the depth transformer |
-| 15 | Beyond speech | Sound > speech | measure what a speech front end costs birds, drums, rain, music |
-| 16 | Beyond speech | The landscape | map of codecs, tokenizers and audio-LMs, plus open problems |
+The page is an illustrated 3D machine with eleven stations: speaker → microphone → ADC → spectrum analyser → mel printer → encoder → token tray → projector → language model → output, plus a speaker for the model's voice. Each lesson flies the camera to its station, labels the parts with callouts, and puts that station's monitor in an inspector panel so you can see exactly what each setting changes.
 
-Every lesson has a live visual, controls, four tabs (**Overview**, **Under the hood**, **What's lost**, **Specs**), and a **Try it yourself** snippet in Python. Its ▶ button runs the same computation in the browser on the current audio.
+| # | Chapter | Lesson | You can |
+|---|---------|--------|---------|
+| – | Start | How a computer hears you | record yourself and watch the sound travel through every station |
+| 1 | Capture | Sound is moving air | change pitch, loudness and wave shape; see wavelength and pressure |
+| 2 | Capture | The microphone | switch capsule types; set preamp gain and hear hiss vs clipping |
+| 3 | Capture | Sampling | click the crystal clock to change the rate; push a tone past Nyquist and hear it alias |
+| 4 | Capture | Bit depth | drop bits, toggle dither, read the measured SNR |
+| 5 | Represent | From wave to frequencies | move a 10–100 ms window through the sound; the 3D bars show its spectrum |
+| 6 | Represent | Spectrogram and mel scale | turn the band dial, watch the printer print, hear only the band energies |
+| 7 | Represent | What the front end throws away | switch on mono / 16 kHz / no phase / 80 bands / 80 ms and hear the result |
+| 8 | Encode | The encoder | Whisper-shaped convolutions and attention on your sound; plates show each layer |
+| 9 | Encode | Tokens | residual codebooks on the tray; hear 1–8 codebooks; codebooks trained on speech only |
+| 10 | Encode | The projector | pooling factor vs tokens per second and context budget |
+| 11 | Understand | Attention | pick a token, change sharpness and the causal mask, see what it reads from |
+| 12 | Understand | The LM head | temperature / top-p over label scores, or generate new audio tokens and listen |
+| 13 | Models that talk | Mimi | Kyutai's 12.5 Hz split-RVQ codec, bitrate per codebook |
+| 14 | Models that talk | Moshi | step through full-duplex token streams; compare with a cascade |
+| 15 | Beyond speech | What speech pipelines miss | per-sound costs: bandwidth, stereo, timing, pitch, speech-trained codebooks |
+| 16 | Beyond speech | Where the field is | map of codecs and tokenizers, the models that use them, open problems |
+| 17 | Beyond speech | Your voice, end to end | presets, a stage-by-stage table for your recording, and listening at each stage |
+
+Settings changed in one lesson (sample rate, bit depth, frame length, mel bands, stride, pooling) carry forward to every later station and to the end-to-end view.
+
+Each lesson has four tabs (**Overview** with the controls, **How it works**, **What's lost**, **Words & specs**) and a **Try it yourself** snippet in Python whose ▶ button runs the same computation in the browser on the current sound.
 
 ## What's real
 
-- **Audio:** seven sounds synthesised sample by sample (`src/audio/specimens.ts`), plus live microphone, 4-second recording and file upload.
-- **DSP, no libraries** (`src/dsp/`): FFT, STFT/iSTFT, Slaney mel filterbanks, Whisper's log-mel recipe, Griffin-Lim, windowed-sinc resampling, quantisation with dither, k-means, residual VQ, PCA.
-- **Not real:** trained neural weights. The encoder uses seeded random kernels and parameter-free attention, the LM attention patterns and head logits are illustrative, and Mimi's tokens come from a toy k-means codec. Each lesson says which parts are which.
+- **Audio:** seven sounds synthesised sample by sample, your microphone, 4-second recordings and uploaded files.
+- **Signal processing** (`src/dsp/`), written from scratch: FFT plus an exact 400-point DFT, STFT with reflect padding, Slaney mel filterbanks, Whisper's log-mel recipe step for step, Griffin-Lim, windowed-sinc resampling, quantisation with dither, k-means, residual VQ.
+- **Model parts** run on your sound with untrained (seeded) weights: Whisper-shaped convolutions, attention, an 8-codebook toy codec at Mimi's 80 ms frame rate, a label head and a next-token model over codec tokens. Each lesson says what is real and what is simplified. Mimi and Moshi themselves need their trained weights; their lessons show how to run them.
 
 ## Code map
 
 ```
-src/main.ts          app shell: layout, routing, progress, console, source bar, keys
-src/style.css        palette + components
-src/audio/           AudioContext engine, synthesised specimens
-src/dsp/             signal processing
-src/ui/              DOM / canvas helpers, Python highlighter
-src/lessons/         one module per chapter, registered in lessons/index.ts
+src/main.ts         app shell: layout, lessons, callouts, inspector, view bar, flow animation
+src/scene/          three.js world, toon materials and outlines, the stations, monitors
+src/analysis.ts     the current sound run through the pipeline settings (mel, encoder, codes, labels)
+src/pipeline.ts     shared pipeline settings and presets
+src/audio/          Web Audio engine and synthesised sounds
+src/dsp/            signal processing
+src/lessons/        one file per chapter; kit.ts holds monitor drawing helpers
 ```
 
-Keys: <kbd>Space</kbd> play/stop · <kbd>R</kbd> run · <kbd>←</kbd> <kbd>→</kbd> lessons.
+Keys: <kbd>Space</kbd> play · <kbd>R</kbd> run · <kbd>←</kbd> <kbd>→</kbd> lessons · <kbd>Q</kbd> <kbd>E</kbd> turn · <kbd>+</kbd> <kbd>−</kbd> zoom · <kbd>0</kbd> reset view. Drag to pan.
 
 Visual style after [Learn Arduino](https://learn-arduino-red.vercel.app/) by Dilum Sanjaya.

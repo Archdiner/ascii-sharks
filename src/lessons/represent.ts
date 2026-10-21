@@ -1,467 +1,387 @@
 import type { Lesson } from "../types";
-import { el, surface, loop, PALETTE, label, roundRect, wave, segmented, toggle, button, controls, fmtHz, fmtBits, heatmap, RAMP, nextFrame } from "../ui/dom";
+import { slider, segmented, toggle, button, el } from "../ui/dom";
+import { bus } from "../scene/bus";
 import { magSpectrum, hann, nextPow2 } from "../dsp/fft";
-import { melBank, hzToMel, melToHz, whisperLogMel } from "../dsp/mel";
-import { stft, magnitudes } from "../dsp/stft";
-import { stat } from "./capture";
-import { mel16, melDisplay, cached, specImage, drawImage, freqAxis, lossyChain, melFrac, type ChainOpts } from "./shared";
+import { melBank } from "../dsp/mel";
+import { derive } from "../pipeline";
+import { S, head, unit, screenText, trace, blit, fmtHz, fmtBits, fmtN, specHeat, freqTicks, melFrac, lossyChain, melOnly, type ChainOpts } from "./kit";
 
-// ---------------------------------------------------------------- 5 · frames
+// ---------------------------------------------------------------- 5 · frames and the FFT
 
-export const frames: Lesson = {
-  id: "frames",
-  title: "Frames and the Fourier transform",
+export const spectrum: Lesson = {
+  id: "spectrum",
+  short: "Frequencies",
+  title: "From wave to frequencies",
   chapter: "Represent",
-  blurb: "Cut the waveform into short overlapping slices, then ask each slice which frequencies it contains. This is how most audio models first look at a signal.",
-  rail: [3],
-  rate: { value: "256 kb/s", note: "same samples, re-sliced" },
-  tabs: {
-    overview: `
-      <p class="lead">A waveform tells you <i>when</i> but hides <i>what pitch</i>. The <b>Fourier transform</b> tells you what pitch but hides when.</p>
-      <p>The compromise is to look at a short <b>frame</b> at a time. Speech models use <b>25 ms</b> frames, short enough that a vowel is roughly steady inside one, and step forward <b>10 ms</b> (the <b>hop</b>) between frames, so they overlap.</p>
-      <p>Each frame is multiplied by a <b>window</b> (a smooth bump) so its edges fade to zero, then run through an FFT. The result shows how strong each frequency is in that 25 ms.</p>
-      <p><b>Drag across the waveform</b> to move the frame, or press play and it follows along. With the Vowels sound, the peaks in the spectrum are the harmonics of the voice.</p>`,
-    hood: `
-      <p>An FFT of <code>N</code> samples gives <code>N/2 + 1</code> frequency bins spaced <code>sr / N</code> apart. A 25 ms frame at 16 kHz is 400 samples; Whisper zero-pads it to 512 for the FFT.</p>
-      <p>There's a built-in trade-off, the <b>time–frequency uncertainty</b>: longer windows resolve pitch finely but blur fast events together, and short windows do the opposite. Try 10 ms against 100 ms on the Drum loop and then on the Piano chord.</p>
-      <p>Without a window (<b>Rect</b>), the frame's hard edges smear energy across the whole spectrum. This is called <b>spectral leakage</b>.</p>`,
-    lost: `
-      <p class="lostline"><b>Phase, soon.</b> The FFT gives a magnitude <i>and</i> a phase for every bin. Almost every speech front end keeps only the magnitude. Phase carries the fine timing of the waveform, which matters for transients, for where a sound sits in space, and for turning the representation back into audio. Lesson 7 lets you hear it removed.</p>
-      <p class="lostline"><b>Time resolution.</b> A 25 ms window can't tell apart two clicks 5 ms apart.</p>`,
-    specs: [
-      ["Whisper window", "25 ms · 400 samples @ 16 kHz"],
-      ["Whisper hop", "10 ms · 160 samples → 100 frames/s"],
-      ["FFT size", "512 (zero-padded)"],
-      ["Bin spacing", "16000 / 512 = 31.25 Hz"],
-      ["Window", "Hann"],
-    ],
-  },
+  thumb: ["fft"],
+  focus: ["fft"],
+  view: { fill: 0.74, offset: [0, 0.03] },
+  callouts: [
+    { at: "fft.screen", icon: "window", title: "One frame", text: "A slice of the samples, faded at both ends by a window so the cut edges don't add false frequencies.", slot: "tl" },
+    { at: "fft.bars", icon: "bars", title: "Spectrum", text: "Each bar is how much of one frequency the slice contains. Low pitches on the left, high on the right.", slot: "bl" },
+    { at: "fft.high", icon: "ruler", title: "Resolution", text: "Longer slices separate close pitches better but blur quick events.", slot: "br" },
+  ],
+  summary: "A list of samples shows how pressure changes over time, but not which pitches are in it. The <b>Fourier transform</b> answers that for one short slice of sound at a time: it measures how strongly each frequency is present. Almost every audio model starts this way.",
+  steps: [
+    "Cut the samples into short, overlapping <b>frames</b>. Whisper uses 25 ms frames (400 samples at 16 kHz) and starts a new one every 10 ms. That step is called the <b>hop</b>.",
+    "Multiply each frame by a <b>window</b>, a smooth bump that fades the frame's edges to zero. A wave cut off abruptly looks like it contains frequencies it doesn't (this is called spectral leakage).",
+    "Run the <b>FFT</b> (fast Fourier transform). For each test frequency it measures how closely the frame matches a wave at that frequency. 400 samples give 201 results, spaced 40 Hz apart (16,000 ÷ 400).",
+    "Each result has a <b>magnitude</b> (how much of that frequency) and a <b>phase</b> (where in its cycle that wave was when the frame started). The bars show the magnitude.",
+    "There's a built-in trade-off. A longer frame separates close pitches better but blurs quick events together. Compare 10 ms and 100 ms on the <i>Drum loop</i>, then on the <i>Piano chord</i>.",
+  ],
+  lost: `<ul>
+    <li><b>Phase, in the next step.</b> Speech front ends keep only the magnitudes. Phase holds the fine timing of the wave: sharp attacks, the exact waveform shape, and timing differences between ears.</li>
+    <li><b>Timing inside a frame.</b> Two clicks 5 ms apart fall in the same 25 ms frame and can't be told apart.</li>
+  </ul>`,
+  words: [
+    ["Frame", "A short slice of samples analysed as one unit (Whisper: 25 ms)."],
+    ["Hop", "How far the next frame starts after the previous one (Whisper: 10 ms), so frames overlap."],
+    ["Window", "A bump-shaped curve multiplied into each frame to fade its edges. Whisper uses the Hann window."],
+    ["Fourier transform", "Splits a signal into the frequencies it's made of."],
+    ["FFT", "Fast Fourier transform: an efficient way to compute it on a computer."],
+    ["Frequency bin", "One of the frequencies the FFT reports, spaced sample rate ÷ frame length apart."],
+    ["Magnitude", "How much of a frequency is present."],
+    ["Phase", "Where in its cycle a frequency's wave is at the start of the frame."],
+  ],
+  specs: [
+    ["Whisper frame", "400 samples = 25 ms"],
+    ["Whisper hop", "160 samples = 10 ms → 100 frames/s"],
+    ["FFT size", "400 → 201 bins, 40 Hz apart"],
+    ["Window", "Hann"],
+    ["Frames in 30 s", "3,000"],
+  ],
   code: `import numpy as np
 
-sr, win, hop = 16000, 400, 160          # 25 ms / 10 ms
-w = np.hanning(win)
+sr, win, hop = 16000, 400, 160               # 25 ms frames, 10 ms hop
+w = np.hanning(win + 1)[:-1]                  # periodic Hann window
 
-frames = [x[i:i+win] * w
-          for i in range(0, len(x) - win, hop)]
-spec = np.abs(np.fft.rfft(frames, n=512))   # (T, 257)
+frames = np.stack([x[i:i + win] * w for i in range(0, len(x) - win, hop)])
+spec = np.abs(np.fft.rfft(frames, n=win))     # (frames, 201) magnitudes
 
-print(len(frames), "frames ->", spec.shape)
-peak = spec.mean(0).argmax() * sr / 512
-print("strongest bin ≈", peak, "Hz")`,
+freqs = np.fft.rfftfreq(win, 1 / sr)          # 0, 40, 80, ... 8000 Hz
+print(spec.shape, "strongest:", freqs[spec.mean(0).argmax()], "Hz")`,
+  rate: (p) => { const d = derive(p); return { value: fmtBits(d.melFps * (d.winSamples / 2 + 1) * 32), note: `${d.melFps} frames/s × ${Math.floor(d.winSamples / 2) + 1} values` }; },
   mount(ctx) {
-    const { root, audio } = ctx;
-    let winMs = 25, kind: "hann" | "rect" = "hann", pos = 0.3, drag = false;
-    const top = el("div", { class: "panel", style: "flex:0.8" }, el("span", { class: "panel-title" }, "Waveform · 16 kHz · drag to move the frame"));
-    const row = el("div", { class: "viz-row", style: "flex:1.3" });
-    const pf = el("div", { class: "panel" }, el("span", { class: "panel-title" }, "One frame × window"));
-    const ps = el("div", { class: "panel", style: "flex:1.4" }, el("span", { class: "panel-title" }, "Its spectrum (FFT magnitude)"));
-    row.append(pf, ps);
-    root.append(top, row);
-    const sT = stat("Time resolution"), sF = stat("Bin spacing"), sN = stat("Frames (10 ms hop)"), sPk = stat("Strongest");
-    root.append(controls(
-      segmented("Window", [["10", "10 ms"], ["25", "25 ms"], ["50", "50 ms"], ["100", "100 ms"]], "25", (v) => (winMs = Number(v))),
-      segmented("Shape", [["hann", "Hann"], ["rect", "Rect"]], kind, (v) => (kind = v as "hann" | "rect")),
-    ), el("div", { class: "stat-row" }, sT, sF, sN, sPk));
-    const A = surface(top), B = surface(pf), S = surface(ps);
-    const setPos = (e: PointerEvent) => { const r = A.canvas.getBoundingClientRect(); pos = Math.max(0, Math.min(1, (e.clientX - r.left - 14) / (r.width - 28))); };
-    A.canvas.style.cursor = "ew-resize";
-    A.canvas.addEventListener("pointerdown", (e) => { drag = true; A.canvas.setPointerCapture(e.pointerId); setPos(e); });
-    A.canvas.addEventListener("pointermove", (e) => drag && setPos(e));
-    A.canvas.addEventListener("pointerup", () => (drag = false));
-    const stop = loop(() => {
-      const x = audio.mono(16000), sr = 16000;
+    const { audio } = ctx;
+    let pos = 0.35, shape: "hann" | "rect" = "hann";
+    ctx.row("cut", "<b>Frame length.</b> The window size Whisper uses is 25 ms. This setting carries forward to the mel bands and the encoder.",
+      segmented("Frame", [["10", "10 ms"], ["25", "25 ms"], ["50", "50 ms"], ["100", "100 ms"]], String(ctx.pipe().winMs), (v) => ctx.setPipe({ winMs: Number(v) })));
+    ctx.row("window", "<b>Window shape.</b> Compare the bars with and without fading the edges. Without it, energy smears across every frequency.",
+      segmented("Window", [["hann", "Hann"], ["rect", "None"]], shape, (v) => (shape = v as "hann" | "rect")));
+    const posS = slider({ label: "Position", min: 0, max: 1, step: 0.001, value: pos, fmt: (v) => `${(v * (audio.clip.channels[0].length / audio.clip.sr)).toFixed(2)} s`, onInput: (v) => (pos = v) });
+    ctx.row("target", "<b>Where in the sound.</b> Drag to move the frame, or press play and it follows the sound.", posS);
+    const sRes = ctx.stat("Frequency step"), sT = ctx.stat("Time span"), sBins = ctx.stat("Bins"), sPk = ctx.stat("Strongest");
+    let spec: Float32Array = new Float32Array(1), frame: Float32Array = new Float32Array(1), win: Float32Array = new Float32Array(1), start = 0;
+    const compute = () => {
+      const a = ctx.analysis(), sr = ctx.pipe().sr, x = a.x;
       const p = audio.position();
-      if (p >= 0 && audio.playing === "clip" && !drag) pos = Math.min(1, p / audio.duration);
-      const n = Math.round((winMs / 1000) * sr);
-      const start = Math.max(0, Math.min(x.length - n, Math.floor(pos * x.length - n / 2)));
-      const frame = x.subarray(start, start + n);
-      const w = kind === "hann" ? hann(n) : new Float32Array(n).fill(1);
-      const nFft = Math.max(512, nextPow2(n));
-      const mag = magSpectrum(frame, nFft, w);
-      {
-        const { g, w: W, h } = A;
-        g.clearRect(0, 0, W, h);
-        wave(g, x, 14, 24, W - 28, h - 30, PALETTE.navy2, 1, 0, x.length, 1.4);
-        const fx = 14 + (start / x.length) * (W - 28), fw = Math.max(3, (n / x.length) * (W - 28));
-        g.fillStyle = "#1aa3a133"; g.fillRect(fx, 22, fw, h - 26);
-        g.strokeStyle = PALETTE.teal; g.lineWidth = 2; g.strokeRect(fx, 22, fw, h - 26);
-        label(g, `${(start / sr).toFixed(3)} s`, fx + fw + 4, 34, { size: 10.5, mono: true, color: PALETTE.tealDeep, weight: 400 });
+      if (p >= 0 && audio.playing === "clip") { pos = Math.min(1, p / audio.duration); posS.set(pos); }
+      const n = derive(ctx.pipe()).winSamples;
+      start = Math.max(0, Math.min(x.length - n, Math.floor(pos * x.length - n / 2)));
+      frame = x.slice(start, start + n);
+      win = shape === "hann" ? hann(n) : new Float32Array(n).fill(1);
+      const nFft = n <= 512 ? n : nextPow2(n);
+      spec = magSpectrum(frame, nextPow2(nFft), win);
+      // hand the 3D bars this frame's spectrum in dB
+      let mx = 1e-9; for (const v of spec) mx = Math.max(mx, v);
+      bus.hold = spec.map((v) => 20 * Math.log10(Math.max(v / mx, 1e-6)) - 10);
+      bus.holdSr = sr;
+      let pk = 1; for (let k = 2; k < spec.length; k++) if (spec[k] > spec[pk]) pk = k;
+      sRes.set(`${(sr / n).toFixed(1)} Hz`);
+      sT.set(`${ctx.pipe().winMs} ms`);
+      sBins.set(fmtN(Math.floor(n / 2) + 1));
+      sPk.set(fmtHz((pk * sr) / ((spec.length - 1) * 2)));
+    };
+    const tick = ctx.world.onTick(compute);
+    ctx.screen("fft", (g, w, h) => {
+      const u = unit(h);
+      const a = ctx.analysis(), x = a.x;
+      head(g, w, h, `Frame of ${ctx.pipe().winMs} ms`, `${(start / ctx.pipe().sr).toFixed(2)} s`);
+      // whole sound with the frame marked
+      trace(g, x, 4 * u, 14 * u, w - 8 * u, 18 * u, "#6c7a9e", 0.4 * u, 1.5);
+      const fx = 4 * u + (start / x.length) * (w - 8 * u), fw = Math.max(0.8 * u, (frame.length / x.length) * (w - 8 * u));
+      g.fillStyle = "#1aa3a155"; g.fillRect(fx, 14 * u, fw, 18 * u);
+      // the frame and its window
+      trace(g, frame, 4 * u, 34 * u, w * 0.4, 30 * u, "#6c7a9e", 0.5 * u, 1.4);
+      trace(g, frame.map((v, i) => v * win[i]), 4 * u, 34 * u, w * 0.4, 30 * u, S.teal, 0.7 * u, 1.4);
+      screenText(g, "× window", 4 * u, 70 * u, 4.6 * u, S.teal);
+      // spectrum on a log-frequency axis
+      const sx = w * 0.46, sw = w - sx - 4 * u, sy = 34 * u, sh = 52 * u, nyq = ctx.pipe().sr / 2;
+      let mx = 1e-9; for (const v of spec) mx = Math.max(mx, v);
+      g.beginPath();
+      for (let k = 1; k < spec.length; k++) {
+        const hz = (k / (spec.length - 1)) * nyq;
+        const px = sx + (Math.log(hz / 30) / Math.log(nyq / 30)) * sw;
+        const d = Math.max(-70, 20 * Math.log10(spec[k] / mx + 1e-9));
+        const py = sy + sh * (-d / 70);
+        k > 1 ? g.lineTo(px, py) : g.moveTo(px, py);
       }
-      {
-        const { g, w: W, h } = B;
-        g.clearRect(0, 0, W, h);
-        const y0 = 26, hh = h - 34;
-        const raw = Array.from(frame);
-        wave(g, raw, 12, y0, W - 24, hh, PALETTE.trace, 1.2, 0, raw.length, 1.4);
-        const win = Array.from(frame, (v, i) => v * w[i]);
-        wave(g, win, 12, y0, W - 24, hh, PALETTE.navy, 1.8, 0, win.length, 1.4);
-        g.strokeStyle = PALETTE.teal; g.setLineDash([4, 3]); g.lineWidth = 1.2; g.beginPath();
-        for (let i = 0; i < n; i++) { const px = 12 + (i / (n - 1)) * (W - 24), py = y0 + hh / 2 - w[i] * (hh / 2) * 0.95; i ? g.lineTo(px, py) : g.moveTo(px, py); }
-        g.stroke(); g.setLineDash([]);
-        label(g, `${n} samples`, W - 12, 18, { align: "right", size: 10.5, mono: true, color: PALETTE.faint, weight: 400 });
-      }
-      let peakBin = 1;
-      {
-        const { g, w: W, h } = S;
-        g.clearRect(0, 0, W, h);
-        const x0 = 34, y0 = 26, ww = W - 46, hh = h - 46;
-        let mx = 1e-9; for (const v of mag) mx = Math.max(mx, v);
-        for (let k = 2; k < mag.length; k++) if (mag[k] > mag[peakBin]) peakBin = k;
-        g.strokeStyle = PALETTE.lineSoft; g.lineWidth = 1;
-        for (let d = 0; d <= 80; d += 20) { const y = y0 + (d / 80) * hh; g.beginPath(); g.moveTo(x0, y); g.lineTo(x0 + ww, y); g.stroke(); label(g, `-${d}`, x0 - 4, y + 3, { align: "right", size: 9.5, mono: true, color: PALETTE.faint, weight: 400 }); }
-        g.beginPath();
-        for (let k = 0; k < mag.length; k++) {
-          const d = Math.max(-80, 20 * Math.log10(mag[k] / mx + 1e-12));
-          const px = x0 + (k / (mag.length - 1)) * ww, py = y0 + (-d / 80) * hh;
-          k ? g.lineTo(px, py) : g.moveTo(px, py);
-        }
-        g.lineTo(x0 + ww, y0 + hh); g.lineTo(x0, y0 + hh); g.closePath();
-        g.fillStyle = "#1aa3a12a"; g.fill();
-        g.strokeStyle = PALETTE.tealDeep; g.lineWidth = 1.5; g.stroke();
-        for (let f = 0; f <= 8000; f += 2000) label(g, f ? `${f / 1000}k` : "0", x0 + (f / 8000) * ww, y0 + hh + 14, { align: "center", size: 10, mono: true, color: PALETTE.faint, weight: 400 });
-        const pkx = x0 + (peakBin / (mag.length - 1)) * ww;
-        g.fillStyle = PALETTE.orange; g.beginPath(); g.arc(pkx, y0 + 4, 4, 0, 7); g.fill();
-      }
-      sT.set(`${winMs} ms`);
-      sF.set(`${(sr / nFft).toFixed(1)} Hz`);
-      sN.set(`${Math.max(0, Math.floor((x.length - n) / 160) + 1)}`);
-      sPk.set(fmtHz((peakBin * sr) / nFft));
+      g.strokeStyle = S.orange; g.lineWidth = 0.6 * u; g.stroke();
+      for (const t of [100, 1000, 4000]) if (t < nyq) screenText(g, t >= 1000 ? `${t / 1000}k` : `${t}`, sx + (Math.log(t / 30) / Math.log(nyq / 30)) * sw, sy + sh + 6 * u, 4.4 * u, S.dim, "center", true);
+      screenText(g, "Hz →", sx + sw, sy + sh + 6 * u, 4.4 * u, S.dim, "right");
     });
-    return () => { stop(); A.dispose(); B.dispose(); S.dispose(); };
+    return () => { tick(); bus.hold = null; };
   },
   run(ctx) {
-    const x = ctx.audio.mono(16000);
-    for (const [win, hop] of [[400, 160], [320, 320], [1024, 256]]) {
-      const n = Math.floor((x.length - win) / hop) + 1;
-      ctx.log(`win ${String(win).padStart(4)} hop ${String(hop).padStart(3)} → ${String(n).padStart(4)} frames · ${(16000 / hop).toFixed(1)} frames/s`);
-    }
-    const s = magnitudes(stft(x, 16000, 512, 160, 400));
-    const avg = new Float32Array(257);
-    for (const f of s) for (let k = 0; k < 257; k++) avg[k] += f[k];
-    let pk = 1; for (let k = 2; k < 257; k++) if (avg[k] > avg[pk]) pk = k;
-    ctx.log(`spec shape (${s.length}, 257); strongest bin ≈ ${Math.round((pk * 16000) / 512)} Hz`, "ok");
+    const a = ctx.analysis(), p = ctx.pipe(), d = derive(p);
+    ctx.log(`${fmtN(a.x.length)} samples at ${p.sr} Hz, frames of ${d.winSamples} every ${d.hopSamples}`);
+    ctx.log(`→ ${fmtN(a.mel.frames.length)} frames × ${Math.floor(d.winSamples / 2) + 1} frequencies, ${(p.sr / d.winSamples).toFixed(1)} Hz apart`);
+    for (const ms of [10, 25, 100]) ctx.log(`  ${String(ms).padStart(3)} ms frame: frequency step ${(1000 / ms).toFixed(0).padStart(3)} Hz, events closer than ${ms} ms blur together`, "dim");
+    ctx.log("Short frames: sharp in time, blurry in pitch. Long frames: the reverse.", "ok");
   },
 };
 
-// ---------------------------------------------------------------- 6 · mel
+// ---------------------------------------------------------------- 6 · mel bands
 
-type MelMode = "linear" | "mel80" | "mel128";
+const MELS = [20, 40, 80, 128];
 
 export const mel: Lesson = {
   id: "mel",
-  title: "Spectrograms and the mel scale",
+  short: "Mel spectrogram",
+  title: "The spectrogram and the mel scale",
   chapter: "Represent",
-  blurb: "Stack the frames side by side and you get a picture of sound. Squeeze its frequency axis the way your ear does and you get the log-mel spectrogram, the input to Whisper and most speech models.",
-  rail: [4],
-  rate: { value: "256 kb/s", note: "80 floats × 100 frames/s" },
-  tabs: {
-    overview: `
-      <p class="lead">A <b>spectrogram</b> is the frames from the last lesson laid side by side: time left to right, frequency bottom to top, loudness as colour.</p>
-      <p>Ears hear pitch roughly logarithmically: 100→200 Hz sounds like the same step as 1000→2000 Hz. The <b>mel scale</b> matches that, linear below about 1 kHz and logarithmic above.</p>
-      <p>A <b>mel filterbank</b> is a set of overlapping triangles that are narrow at low frequencies and wide at high ones (see the right-hand panel). It sums the 257 FFT bins into <b>80 mel bands</b>. Then a <b>log</b> compresses loudness the way ears do.</p>
-      <p>The result, the <b>log-mel spectrogram</b>, is 80 numbers every 10 ms. Whisper, most ASR systems and many TTS models start from it. Switch the modes and compare.</p>`,
-    hood: `
-      <p>Whisper's recipe exactly: 16 kHz audio → STFT (400-sample Hann, hop 160) → power → 80 Slaney mel filters from 0–8 kHz → <code>log10</code> → clamp to within 8 (i.e. <b>80 dB</b>) of the maximum → <code>(x + 4) / 4</code>. Whisper large-v3 uses <b>128</b> bands.</p>
-      <p>This is what the Run button computes on your clip, in your browser.</p>
-      <p>Turn on <b>Live</b> with your mic: the spectrogram scrolls in real time from the analyser. Whistle and you get one bright line. Say "sss" and you get a smear near the top. Hum and you get a ladder of harmonics.</p>`,
-    lost: `
-      <ul>
-        <li class="lostline"><b>Phase:</b> gone. Only magnitudes go into the filterbank.</li>
-        <li class="lostline"><b>Fine pitch at the top:</b> the highest mel bands are hundreds of Hz wide. Two notes a semitone apart up there land in the same band.</li>
-        <li class="lostline"><b>Quiet detail:</b> anything more than 80 dB below the loudest moment is clamped to the floor.</li>
-        <li class="lostline"><b>Above 8 kHz:</b> not represented at all for a 16 kHz model.</li>
-      </ul>
-      <p>That's 257 bins with phase reduced to 80 magnitudes. You can't get the waveform back exactly from this, only an approximation (next lesson).</p>`,
-    specs: [
-      ["Input", "16 kHz mono float32"],
-      ["STFT", "Hann 400 · hop 160 · n_fft 400"],
-      ["Mel bands", "80 (v1–v2) · 128 (large-v3)"],
-      ["Range", "0 – 8 kHz, Slaney mel"],
-      ["Frames", "100 / s · 3000 per 30 s"],
-      ["Scaling", "log10, clamp max−8, (x+4)/4"],
-    ],
-  },
+  thumb: ["mel"],
+  focus: ["mel"],
+  view: { fill: 0.74, offset: [0, 0.03] },
+  callouts: [
+    { at: "mel.paper", icon: "sheet", title: "Spectrogram", text: "Time runs down the paper, pitch from left (low) to right (high). Darker means louder. Press play to watch it print.", slot: "tr" },
+    { at: "mel.knob", icon: "knob", title: "Band dial", text: "How many mel bands to print. Click it to turn.", slot: "br" },
+    { at: "mel.screen", icon: "filter", title: "Filterbank", text: "Each triangle adds up the energy near one pitch. Low ones are narrow, high ones wide.", slot: "tl" },
+  ],
+  summary: "Put the spectrum of every frame side by side and you get a <b>spectrogram</b>, a picture of the sound. Speech models then shrink it the way hearing works: they merge the frequencies into about 80 <b>mel bands</b>, narrow for low pitches and wide for high ones, and take the logarithm of the loudness. The result is the input to Whisper and most speech models.",
+  steps: [
+    "Lay the spectra side by side: time across, frequency up, loudness as colour. That's a spectrogram.",
+    "People hear pitch roughly logarithmically: 100 → 200 Hz sounds like the same step as 1,000 → 2,000 Hz. The <b>mel scale</b> copies this. It's close to even below 1 kHz and logarithmic above.",
+    "A <b>mel filterbank</b> is a row of overlapping triangles spaced evenly on the mel scale. Each one adds up the energy of the FFT bins under it, giving one number per band.",
+    "Take log10 of each band, because hearing compresses loudness the same way: ten times the energy sounds about twice as loud.",
+    "Whisper's exact recipe: 80 bands from 0 to 8 kHz, log10, keep only the top 80 dB, then rescale to roughly −1 to 1. Whisper large-v3 uses 128 bands. At 100 frames a second that's 8,000 numbers per second.",
+  ],
+  lost: `<ul>
+    <li><b>Phase is gone completely.</b> Only the energy in each band is kept. Press <b>Hear only the bands</b> to listen to a reconstruction: the words survive, the clarity doesn't.</li>
+    <li><b>Fine pitch in the upper range.</b> With 80 bands at 16 kHz, a band near 4 kHz spans several hundred hertz, several semitones. Two notes that close merge into one number.</li>
+    <li><b>Quiet detail.</b> Anything more than 80 dB below the loudest moment is raised to that floor.</li>
+    <li><b>Everything above half the sample rate</b>, lost earlier at the ADC.</li>
+  </ul>`,
+  words: [
+    ["Spectrogram", "A picture of sound: time across, frequency up, loudness as colour."],
+    ["Mel scale", "A pitch scale spaced the way people hear: even steps sound like even changes in pitch."],
+    ["Filterbank", "A set of filters, each passing one range of frequencies."],
+    ["Mel band", "One filter's output: the total energy in one range of pitches."],
+    ["Log-mel spectrogram", "Mel bands with the logarithm of their energy. The standard input to speech models."],
+    ["Semitone", "One step on a piano keyboard, a frequency ratio of about 1.06."],
+  ],
+  specs: [
+    ["Whisper bands", "80 (v1–v2) · 128 (large-v3)"],
+    ["Range", "0 – 8 kHz (Slaney mel)"],
+    ["Frames", "100 per second, 3,000 per 30 s"],
+    ["Numbers per second", "8,000 (80 bands)"],
+    ["Loudness kept", "top 80 dB"],
+  ],
   code: `import torch, torchaudio
 
 wav, sr = torchaudio.load("clip.wav")
 wav = torchaudio.functional.resample(wav.mean(0), sr, 16000)
 
-stft = torch.stft(wav, 400, 160, window=torch.hann_window(400),
+spec = torch.stft(wav, n_fft=400, hop_length=160, window=torch.hann_window(400),
                   return_complex=True)
-power = stft.abs() ** 2                       # phase dropped here
-mel = torchaudio.functional.melscale_fbanks(
-        201, 0, 8000, 80, 16000, norm="slaney", mel_scale="slaney")
-logmel = (mel.T @ power).clamp(min=1e-10).log10()
-logmel = torch.maximum(logmel, logmel.max() - 8.0)
+power = spec.abs()[..., :-1] ** 2                  # phase is dropped here
+fb = torchaudio.functional.melscale_fbanks(201, 0, 8000, 80, 16000,
+                                           norm="slaney", mel_scale="slaney")
+logmel = (fb.T @ power).clamp(min=1e-10).log10()
+logmel = torch.maximum(logmel, logmel.max() - 8.0)  # keep the top 80 dB
 logmel = (logmel + 4.0) / 4.0
-print(logmel.shape)                           # (80, T)`,
+print(logmel.shape)                                 # (80, frames)`,
+  rate: (p) => { const d = derive(p); return { value: fmtBits(d.melBps), note: `${p.nMels} bands × ${d.melFps}/s × 32 bit` }; },
   mount(ctx) {
-    const { root, audio } = ctx;
-    let mode: MelMode = "mel80", live = false;
-    const row = el("div", { class: "viz-row", style: "flex:1" });
-    const main = el("div", { class: "panel", style: "flex:4" }, el("span", { class: "panel-title" }, "Spectrogram"));
-    const side = el("div", { class: "panel", style: "flex:1;min-width:110px" }, el("span", { class: "panel-title" }, "Filterbank"));
-    row.append(main, side);
-    root.append(row);
-    const sShape = stat("Shape"), sBand = stat("Top band width"), sSrc = stat("Source");
-    root.append(controls(
-      segmented<MelMode>("View", [["linear", "Linear 257"], ["mel80", "Mel 80"], ["mel128", "Mel 128"]], mode, (v) => { mode = v; dirty = true; }),
-      toggle("Live (mic / playback)", live, (v) => { live = v; if (v && !audio.live) audio.startMic().catch(() => ctx.log("Mic unavailable; play the clip instead.", "warn")); }),
-    ), el("div", { class: "stat-row" }, sShape, sBand, sSrc));
-    const M = surface(main), F = surface(side);
-    let dirty = true, img: HTMLCanvasElement | null = null, T = 0, bins = 0;
-    const off = audio.on(() => (dirty = true));
-    const scroll = document.createElement("canvas");
-    scroll.width = 600; scroll.height = 160;
-    const sg = scroll.getContext("2d")!;
-    sg.fillStyle = "#f9f2e5"; sg.fillRect(0, 0, 600, 160);
-    const fd = new Float32Array(2048);
-    const stop = loop(() => {
-      const nM = mode === "mel128" ? 128 : 80;
-      if (dirty) {
-        dirty = false;
-        const x = audio.mono(16000);
-        if (mode === "linear") {
-          const s = cached(`lin:${audio.clip.id}`, () => {
-            const m = magnitudes(stft(x, 16000, 512, 160, 400));
-            let mx = 1e-9; for (const f of m) for (const v of f) mx = Math.max(mx, v);
-            return m.map((f) => f.map((v) => 1 + (20 * Math.log10(Math.max(v / mx, 1e-9))) / 80));
-          });
-          img = heatmap(s, 257); T = s.length; bins = 257;
-        } else {
-          const lm = nM === 80 ? mel16(audio) : cached(`mel128:${audio.clip.id}`, () => whisperLogMel(audio.mono(16000), 128));
-          img = heatmap(melDisplay(lm.frames), nM * 2); T = lm.frames.length; bins = nM;
-        }
+    const { audio } = ctx;
+    const nm = () => ctx.pipe().nMels;
+    const mS = slider({ label: "Bands", min: 16, max: 128, step: 8, value: nm(), onInput: (v) => ctx.setPipe({ nMels: v }) });
+    ctx.click("mel", (part) => { if (part !== "knob") return; const next = MELS.find((m) => m > nm()) ?? MELS[0]; ctx.setPipe({ nMels: next }); mS.set(next); }, (part) => (part === "knob" ? "Click to change the number of bands" : part === "paper" ? "The printed spectrogram of the current sound" : null));
+    ctx.row("knob", "<b>Number of bands.</b> Turn the dial on the printer, or drag. Fewer bands means a blurrier picture with fewer numbers.", mS);
+    ctx.row("play", "<b>Watch it print.</b> Press play in the bar below: the paper prints the sound as it plays.");
+    ctx.row("ear", "<b>Hear only the bands.</b> Rebuild sound from the band energies alone, at the current settings. Then try 16 bands.",
+      el("div", { class: "btns" }, button("▶ Hear only the bands", () => {
+        const a = ctx.analysis();
+        ctx.log("Rebuilding from band energies (guessing the missing phase)…", "dim");
+        setTimeout(() => audio.playSignal([melOnly(a.x, a.pipe.sr, a.pipe.nMels, a.clip.id)], a.pipe.sr), 30);
+      }, "btn primary"), button("▶ Original", () => audio.playClip(), "btn")));
+    const sB = ctx.stat("Bands"), sN = ctx.stat("Numbers / second"), sLo = ctx.stat("Width at 250 Hz"), sHi = ctx.stat("Width at 4 kHz");
+    const width = (hz: number) => {
+      const p = ctx.pipe(), bank = melBank(p.sr, 512, p.nMels, 0, p.sr / 2);
+      let m = 0;
+      for (let j = 0; j < p.nMels; j++) if (Math.abs(bank.edges[j + 1] - hz) < Math.abs(bank.edges[m + 1] - hz)) m = j;
+      return (bank.edges[m + 2] - bank.edges[m]) / 2;
+    };
+    const update = () => {
+      const p = ctx.pipe();
+      sB.set(String(p.nMels));
+      sN.set(fmtN(p.nMels * derive(p).melFps));
+      sLo.set(`${Math.round(width(250))} Hz`);
+      sHi.set(p.sr / 2 > 4000 ? `${Math.round(width(4000))} Hz` : "above range");
+    };
+    update();
+    const tick = ctx.world.onTick(update);
+    ctx.screen("mel", (g, w, h) => {
+      const u = unit(h), p = ctx.pipe(), nyq = p.sr / 2;
+      head(g, w, h, `${p.nMels} mel filters`, `0 – ${fmtHz(nyq)}`);
+      const bank = melBank(p.sr, 512, p.nMels, 0, nyq);
+      const x0 = 4 * u, ww = w - 8 * u, base = 74 * u, top = 20 * u;
+      const X = (hz: number) => x0 + (hz / nyq) * ww;
+      const every = p.nMels > 64 ? 2 : 1;
+      for (let m = 0; m < p.nMels; m += every) {
+        g.beginPath(); g.moveTo(X(bank.edges[m]), base); g.lineTo(X(bank.edges[m + 1]), top); g.lineTo(X(bank.edges[m + 2]), base);
+        g.strokeStyle = (m / every) % 2 ? S.teal : S.orange; g.lineWidth = 0.4 * u; g.stroke();
       }
-      const { g, w, h } = M;
-      g.clearRect(0, 0, w, h);
-      const x0 = 40, y0 = 34, ww = w - 52, hh = h - 52;
-      const isLive = live && audio.live && audio.analyser;
-      if (isLive) {
-        audio.freqData(fd);
-        const sr = audio.sampleRate, nb = fd.length;
-        sg.drawImage(scroll, -2, 0);
-        for (let y = 0; y < 160; y++) {
-          const frac = (159 - y) / 159;
-          const hz = mode === "linear" ? frac * 8000 : melToHz(frac * hzToMel(8000));
-          const b = Math.min(nb - 1, Math.round((hz / (sr / 2)) * nb));
-          const v = Math.max(0, Math.min(1, (fd[b] + 100) / 75));
-          const ci = Math.round(v * 255) * 3;
-          sg.fillStyle = `rgb(${RAMP[ci]},${RAMP[ci + 1]},${RAMP[ci + 2]})`;
-          sg.fillRect(598, y, 2, 1);
-        }
-        drawImage(g, scroll, x0, y0, ww, hh);
-        label(g, "LIVE", w - 14, 18, { align: "right", size: 11, color: PALETTE.red, weight: 700 });
-      } else if (img) {
-        drawImage(g, img, x0, y0, ww, hh);
-        const p = audio.position();
-        if (p >= 0 && audio.playing === "clip") { const px = x0 + (p / audio.duration) * ww; g.fillStyle = PALETTE.orange; g.fillRect(px - 1, y0, 2, hh); }
-        label(g, `${T} frames × ${bins} ${mode === "linear" ? "bins" : "mel bands"}`, w - 14, 18, { align: "right", size: 11, mono: true, color: PALETTE.muted, weight: 400 });
-      }
-      // y-axis
-      const ticks = [0, 250, 500, 1000, 2000, 4000, 8000];
-      for (const t of ticks) {
-        const frac = mode === "linear" ? t / 8000 : hzToMel(t) / hzToMel(8000);
-        const py = y0 + hh - frac * hh;
-        label(g, t >= 1000 ? `${t / 1000}k` : String(t), x0 - 5, py + 3, { align: "right", size: 9.5, mono: true, color: PALETTE.faint, weight: 400 });
-        g.fillStyle = PALETTE.line; g.fillRect(x0 - 3, py, 3, 1);
-      }
-      label(g, isLive ? "time →" : `0 – ${audio.duration.toFixed(1)} s →`, x0, h - 6, { size: 10.5, color: PALETTE.faint, weight: 500 });
-      // filterbank
-      {
-        const { g, w: W, h: H } = F;
-        g.clearRect(0, 0, W, H);
-        const bank = melBank(16000, 512, nM, 0, 8000);
-        const fy0 = 40, fh = H - 58;
-        const yOf = (hz: number) => fy0 + fh - (mode === "linear" ? hz / 8000 : hzToMel(hz) / hzToMel(8000)) * fh;
-        // every 4th band, so each triangle stays readable; the rest sit between them
-        const every = mode === "mel128" ? 6 : 4;
-        for (let m = 0; m < nM; m += every) {
-          const lo = bank.edges[m], c = bank.edges[m + 1], hi = bank.edges[m + 2];
-          g.beginPath(); g.moveTo(8, yOf(lo)); g.lineTo(W - 10, yOf(c)); g.lineTo(8, yOf(hi)); g.closePath();
-          g.fillStyle = (m / every) % 2 ? "#1aa3a133" : "#24304a22"; g.fill();
-          g.strokeStyle = (m / every) % 2 ? PALETTE.teal : PALETTE.navy2; g.lineWidth = 1.2; g.stroke();
-        }
-        label(g, `1 of every ${every}`, W - 10, fy0 - 6 + 0, { align: "right", size: 9.5, color: PALETTE.faint, weight: 500 });
-        label(g, "narrow ↓", W / 2, H - 22, { align: "center", size: 10, color: PALETTE.faint, weight: 600 });
-        label(g, "wide ↑", W / 2, H - 8, { align: "center", size: 10, color: PALETTE.faint, weight: 600 });
-        const top = bank.edges[nM + 1] - bank.edges[nM - 1];
-        sBand.set(fmtHz(top / 2));
-      }
-      sShape.set(isLive ? "streaming" : `${bins} × ${T}`);
-      sSrc.set(isLive ? (audio.micOn ? "mic" : "playback") : audio.clip.name);
+      g.strokeStyle = S.ink; g.lineWidth = 0.4 * u; g.beginPath(); g.moveTo(x0, base); g.lineTo(x0 + ww, base); g.stroke();
+      for (let hz = 0; hz <= nyq; hz += nyq > 12000 ? 4000 : 2000) screenText(g, hz ? `${hz / 1000}k` : "0", X(hz), base + 7 * u, 4.4 * u, S.dim, "center", true);
+      screenText(g, "narrow", X(nyq * 0.04), 92 * u, 4.8 * u, S.ink, "left");
+      screenText(g, "wide", X(nyq * 0.92), 92 * u, 4.8 * u, S.ink, "right");
     });
-    return () => { stop(); off(); M.dispose(); F.dispose(); };
+    return () => tick();
   },
   run(ctx) {
-    const lm = mel16(ctx.audio);
-    const fr = lm.frames;
-    let mn = Infinity, mx = -Infinity, sum = 0;
-    for (const f of fr) for (const v of f) { mn = Math.min(mn, v); mx = Math.max(mx, v); sum += v; }
-    ctx.log(`audio  ${ctx.audio.mono(16000).length} samples @ 16 kHz`);
-    ctx.log(`logmel shape (80, ${fr.length})   ${(fr.length / ctx.audio.duration).toFixed(1)} frames/s`);
-    ctx.log(`range  [${mn.toFixed(3)}, ${mx.toFixed(3)}]  mean ${(sum / (fr.length * 80)).toFixed(3)}`);
-    const energy = new Float32Array(80);
-    for (const f of fr) for (let m = 0; m < 80; m++) energy[m] += f[m];
-    const top = [...energy.keys()].sort((a, b) => energy[b] - energy[a]).slice(0, 3);
-    const bank = melBank(16000, 512, 80, 0, 8000);
-    ctx.log(`loudest bands: ${top.map((m) => `#${m} (${fmtHz(bank.edges[m + 1])})`).join(", ")}`);
-    ctx.log("This 80 × T matrix is all a Whisper-style encoder ever sees of your sound.", "ok");
+    const a = ctx.analysis(), p = ctx.pipe();
+    const fr = a.mel.frames;
+    let mn = Infinity, mx = -Infinity;
+    for (const f of fr) for (const v of f) { mn = Math.min(mn, v); mx = Math.max(mx, v); }
+    ctx.log(`log-mel of "${a.clip.name}": ${p.nMels} bands × ${fmtN(fr.length)} frames = ${fmtN(fr.length * p.nMels)} numbers`);
+    ctx.log(`values from ${mn.toFixed(2)} to ${mx.toFixed(2)} (Whisper's scale; the floor is max − 2.0, i.e. 80 dB)`);
+    const energy = new Float32Array(p.nMels);
+    for (const f of fr) for (let m = 0; m < p.nMels; m++) energy[m] += f[m];
+    const bank = melBank(p.sr, 512, p.nMels, 0, p.sr / 2);
+    const top = [...energy.keys()].sort((x, y) => energy[y] - energy[x]).slice(0, 3);
+    ctx.log(`loudest bands: ${top.map((m) => `#${m} around ${fmtHz(bank.edges[m + 1])}`).join(", ")}`);
+    ctx.log("This grid of numbers is everything a Whisper-style encoder receives.", "ok");
   },
 };
 
-// ---------------------------------------------------------------- 7 · where sound gets lost
+// ---------------------------------------------------------------- 7 · what the front end throws away
 
-const STEPS: { key: keyof ChainOpts; name: string; note: string }[] = [
-  { key: "mono", name: "Stereo → mono", note: "average the ears" },
-  { key: "sr16", name: "48 → 16 kHz", note: "drop everything above 8 kHz" },
-  { key: "phase", name: "Drop phase", note: "keep |STFT| only" },
-  { key: "mel", name: "80 mel bands", note: "blur frequency" },
-  { key: "pool", name: "80 ms frames", note: "blur time (12.5 Hz)" },
+const STEPS: { key: keyof ChainOpts; name: string; why: string }[] = [
+  { key: "mono", name: "Stereo → mono", why: "Average the left and right channels. Anything that differed between them (where a sound came from) cancels or merges." },
+  { key: "sr16", name: "48 → 16 kHz", why: "Resample for the model. Everything above 8 kHz is removed." },
+  { key: "phase", name: "Drop phase", why: "Keep only how much of each frequency there is, not where each wave was in its cycle." },
+  { key: "mel", name: "80 mel bands", why: "Merge frequencies into 80 bands spaced like hearing." },
+  { key: "pool", name: "80 ms steps", why: "Average over 80 ms, the frame length of Mimi (lesson 13). Fast events smear." },
 ];
 
 export const lost: Lesson = {
   id: "lost",
-  title: "Where sound gets lost",
+  short: "What's thrown away",
+  title: "What the front end throws away",
   chapter: "Represent",
-  blurb: "Stack the losses up and listen. Each switch is a step real speech pipelines take, run on your clip and turned back into audio so you can hear what's left.",
-  rail: [1, 2, 3, 4],
-  rate: { value: "2.30 M → 256 k", note: "bits in, far less sound" },
-  tabs: {
-    overview: `
-      <p class="lead">So far, each stage looked like a reasonable engineering choice. Stacked together, they remove a lot.</p>
-      <p>Turn the switches on one at a time and press <b>Hear what's kept</b>. The bottom spectrogram shows what survives, and the empty hatched area is gone. Each step is applied to your clip, then the result is <b>rebuilt into sound</b> (phase is guessed with Griffin-Lim) so you can hear it.</p>
-      <p>Try <b>Ping-pong</b> with only <i>Stereo → mono</i>: the motion disappears. Try <b>Birdsong</b> with <i>48 → 16 kHz</i>: half the song is gone. Try <b>Drum loop</b> with <i>80 ms frames</i>: the attacks go soft.</p>
-      <p>A speech pipeline applies all of these by default, because speech <i>mostly</i> survives them.</p>`,
-    hood: `
-      <p>A model doesn't need to turn its input back into sound. But a representation that can't be turned back into the original has thrown information away, and listening to the reconstruction is a quick way to hear what's missing.</p>
-      <p><b>Griffin-Lim</b> (1984) guesses phase by going back and forth between the time and frequency domains, keeping the known magnitudes each time. The "phasey", metallic sound you hear is its guess being wrong. Neural vocoders (HiFi-GAN, Vocos) make much better guesses, but they're still guessing.</p>
-      <p>The bars on the right show the data rate at each stage. Notice that the bit rate drops much less than the sound does: a float32 log-mel frame takes 2,560 bits, but those bits describe a blurred picture.</p>`,
-    lost: `
-      <ul>
-        <li class="lostline"><b>Mono:</b> direction, width, the room's left/right reflections.</li>
-        <li class="lostline"><b>16 kHz:</b> sibilance, breath, cymbals, birds, air. Everything above 8 kHz.</li>
-        <li class="lostline"><b>Phase:</b> sharpness of transients, the waveform's exact shape, inter-channel timing.</li>
-        <li class="lostline"><b>Mel:</b> fine pitch above ~1 kHz, harmonic detail, close musical intervals.</li>
-        <li class="lostline"><b>80 ms frames:</b> rhythm detail, attacks, flams, fast trills.</li>
-      </ul>
-      <p>What's left: roughly what was said, how loud, and the rough shape of the voice. That's what speech recognition needs, and about all it keeps.</p>`,
-    specs: [
-      ["Reconstruction", "Griffin-Lim, 16–28 iters"],
-      ["STFT (48 k / 16 k)", "2048 / 512, hop ¼"],
-      ["Mel step", "80 bands to Nyquist, inverted"],
-      ["Pooling", "mean log-mel over 80 ms"],
-      ["Mimi frame", "80 ms (12.5 Hz)"],
-    ],
-  },
-  code: `import numpy as np, librosa
+  thumb: ["adc", "fft", "mel"],
+  focus: ["mic", "adc", "fft", "mel"],
+  view: { fill: 0.82, offset: [0, 0.03] },
+  callouts: [
+    { at: "mic.grille", icon: "stereo", title: "Stereo → mono", text: "Two ears become one channel.", slot: "tl" },
+    { at: "adc.clock", icon: "clock", title: "48 → 16 kHz", text: "Everything above 8 kHz is removed.", slot: "bl" },
+    { at: "fft.bars", icon: "bars", title: "Phase dropped", text: "How much of each frequency survives, but not the wave's exact shape.", slot: "br" },
+    { at: "mel.screen", icon: "screen", title: "Before and after", text: "Top: the sound as recorded. Bottom: what's left. Hatching means nothing there.", slot: "tr" },
+  ],
+  summary: "Each choice so far is reasonable on its own. Stacked up, they remove a lot. This lesson applies the real steps of a speech front end to the current sound, then turns the result back into audio so you can hear what a speech model is left with.",
+  steps: [
+    "Pick a sound and switch on one step at a time, pressing <b>Hear what's kept</b> after each.",
+    "<i>Ping-pong</i> with only <b>Stereo → mono</b>: the left-right motion disappears.",
+    "<i>Birdsong</i> with <b>48 → 16 kHz</b>: half the song is gone. The monitor shows the empty band above 8 kHz.",
+    "Any sound with <b>Drop phase</b>: a metallic, smeared quality appears. The missing phase has to be guessed (here with the Griffin-Lim algorithm) and the guess is imperfect.",
+    "<i>Drum loop</i> with <b>80 ms steps</b>: the attacks go soft.",
+    "<i>Vowels</i> with everything on: still recognisable. Speech survives these steps, which is why speech models use them.",
+  ],
+  lost: `<ul>
+    <li><b>Mono:</b> direction, width, and the room's left/right reflections.</li>
+    <li><b>16 kHz:</b> sibilance (s, sh), breath, cymbals, birds, and the brightness of a recording.</li>
+    <li><b>Phase:</b> the sharpness of attacks and the exact waveform.</li>
+    <li><b>Mel bands:</b> fine pitch above about 1 kHz, close musical intervals, harmonic detail.</li>
+    <li><b>80 ms steps:</b> rhythm detail, fast trills, the gap between two quick clicks.</li>
+  </ul>
+  <p>What's left is roughly what was said, how loud, and the overall shape of the voice. That's what transcription needs.</p>`,
+  words: [
+    ["Front end", "The fixed processing before the neural network: resampling, framing, FFT, mel bands."],
+    ["Mono", "One audio channel. Stereo has two, left and right."],
+    ["Griffin-Lim", "An algorithm that guesses missing phase by repeatedly converting between waveform and spectrum."],
+    ["Vocoder", "Anything that turns a spectrogram-like representation back into audio. Neural vocoders guess better than Griffin-Lim, but they're still guessing."],
+  ],
+  specs: [
+    ["Rebuild method", "Griffin-Lim, 16–28 rounds"],
+    ["STFT at 48 / 16 kHz", "2048 / 512 points, ¼ hop"],
+    ["Mel step", "80 bands to Nyquist, then spread back"],
+    ["80 ms steps", "average of the log energies"],
+  ],
+  code: `import numpy as np, librosa, soundfile as sf
 
-y = librosa.to_mono(stereo)                      # 1. mono
-y = librosa.resample(y, orig_sr=48000, target_sr=16000)  # 2.
+y, sr = librosa.load("clip.wav", sr=None, mono=False)
+y = librosa.to_mono(y)                                   # 1. mono
+y = librosa.resample(y, orig_sr=sr, target_sr=16000)     # 2. 16 kHz
 S = np.abs(librosa.stft(y, n_fft=512, hop_length=128))   # 3. no phase
-M = librosa.feature.melspectrogram(S=S**2, sr=16000, n_mels=80)  # 4.
+M = librosa.feature.melspectrogram(S=S ** 2, sr=16000, n_mels=80)   # 4.
 
+# hear what's left: spread the bands back out, then guess the phase
 S_hat = librosa.feature.inverse.mel_to_stft(M, sr=16000, n_fft=512)
-y_hat = librosa.griffinlim(S_hat, hop_length=128)  # guess the phase
+y_hat = librosa.griffinlim(S_hat, hop_length=128)
 sf.write("what_the_model_keeps.wav", y_hat, 16000)`,
+  rate: () => ({ value: "2.30 M → 256 k", note: "bits per second, in → out" }),
   mount(ctx) {
-    const { root, audio } = ctx;
-    const opts: ChainOpts = { mono: true, sr16: true, phase: false, mel: false, pool: false };
-    const row = el("div", { class: "viz-row", style: "flex:1" });
-    const col = el("div", { class: "viz-col", style: "flex:3" });
-    const pa = el("div", { class: "panel", style: "flex:1" }, el("span", { class: "panel-title" }, "Original"));
-    const pb = el("div", { class: "panel", style: "flex:1" }, el("span", { class: "panel-title" }, "What the model keeps"));
-    col.append(pa, pb);
-    const pl = el("div", { class: "panel", style: "flex:1.2;min-width:190px" }, el("span", { class: "panel-title" }, "Data rate ladder"));
-    row.append(col, pl);
-    root.append(row);
-    const toggles = STEPS.map((s) => toggle(s.name, opts[s.key], (v) => { opts[s.key] = v; stale(); }, s.note));
-    const hear = button("▶ Hear what's kept", () => void apply(true), "btn primary");
-    root.append(controls(...toggles), controls(hear, button("▶ Original", () => audio.playClip(), "btn"), el("span", { class: "legend", id: "lost-status" }, "")));
-    const A = surface(pa), B = surface(pb), L = surface(pl);
-    let before: HTMLCanvasElement | null = null, after: HTMLCanvasElement | null = null, afterKey = "", busy = false;
-    const status = root.querySelector<HTMLElement>("#lost-status")!;
-    const key = () => `${audio.clip.id}|${STEPS.map((s) => +opts[s.key]).join("")}`;
-    const stale = () => { status.textContent = key() === afterKey ? "" : "switches changed · press Hear to recompute"; };
+    const { audio } = ctx;
+    const o: ChainOpts = { mono: true, sr16: true, phase: false, mel: false, pool: false };
+    let before: HTMLCanvasElement | null = null, after: HTMLCanvasElement | null = null, key = "", busy = false;
     let result: { channels: Float32Array[]; sr: number } | null = null;
+    for (const s of STEPS) ctx.row(s.key === "mono" ? "stereo" : s.key === "sr16" ? "clock" : s.key === "phase" ? "wave" : s.key === "mel" ? "filter" : "cut", `<b>${s.name}.</b> ${s.why}`, toggle(s.name, o[s.key], (v) => { o[s.key] = v; status.text("Switches changed. Press <b>Hear what's kept</b> to rebuild."); }));
+    const status = ctx.row("ear", "Press to apply the switched-on steps to the current sound and listen.",
+      el("div", { class: "btns" }, button("▶ Hear what's kept", () => void apply(true), "btn primary"), button("▶ Original", () => audio.playClip(), "btn")));
+    const sCh = ctx.stat("Channels"), sBw = ctx.stat("Highest pitch"), sPh = ctx.stat("Phase");
+    const k = () => `${audio.clip.id}|${STEPS.map((s) => +o[s.key]).join("")}`;
     async function apply(play: boolean) {
       if (busy) return;
-      const k = key();
-      if (k !== afterKey || !result) {
+      if (k() !== key || !result) {
         busy = true;
-        status.textContent = "computing…";
-        await nextFrame();
+        status.text("Rebuilding…");
+        await new Promise((r) => setTimeout(r, 30));
         const t0 = performance.now();
-        result = lossyChain(audio.clip, opts);
-        after = specImage(result.channels[0], result.sr, 24000, 220);
-        afterKey = k;
+        result = lossyChain(audio.clip, o);
+        after = specHeat(result.channels[0], result.sr, 24000, 200);
+        key = k();
         busy = false;
-        status.textContent = `rebuilt in ${((performance.now() - t0) / 1000).toFixed(1)} s`;
+        status.text(`Rebuilt in ${((performance.now() - t0) / 1000).toFixed(1)} s. Playing what a speech model keeps.`);
       }
+      sCh.set(o.mono ? "1 (was " + (audio.clip.channels[0] === audio.clip.channels[1] ? "1)" : "2)") : "unchanged");
+      sBw.set(o.sr16 ? "8 kHz" : fmtHz(audio.clip.sr / 2));
+      sPh.set(o.phase || o.mel || o.pool ? "guessed" : "kept");
       if (play && result) audio.playSignal(result.channels, result.sr);
     }
-    const refreshBefore = () => { before = specImage(audio.clip.channels[0], audio.clip.sr, 24000, 220); void apply(false); };
-    const off = audio.on(() => { if (!before || audio.clip.id !== afterKey.split("|")[0]) refreshBefore(); });
-    refreshBefore();
-    const stop = loop(() => {
-      for (const [S, im, which] of [[A, before, "a"], [B, after, "b"]] as const) {
-        const { g, w, h } = S;
-        g.clearRect(0, 0, w, h);
-        const x0 = 40, y0 = 34, ww = w - 50, hh = h - 42;
-        if (im) drawImage(g, im, x0, y0, ww, hh);
-        freqAxis(g, x0, y0, hh, 24000);
-        if (which === "b" && opts.sr16 && afterKey) { const yy = y0 + hh - melFrac(8000, 24000) * hh; g.strokeStyle = PALETTE.red; g.setLineDash([4, 3]); g.beginPath(); g.moveTo(x0, yy); g.lineTo(x0 + ww, yy); g.stroke(); g.setLineDash([]); label(g, "8 kHz: nothing above", x0 + ww - 4, yy - 5, { align: "right", size: 11, color: PALETTE.red, weight: 700 }); }
+    const refresh = () => { before = specHeat(audio.clip.channels[0], audio.clip.sr, 24000, 200); void apply(false); };
+    refresh();
+    ctx.onChange(() => { if (!key.startsWith(audio.clip.id)) refresh(); });
+    ctx.screen("mel", (g, w, h) => {
+      const u = unit(h);
+      head(g, w, h, "Recorded  /  kept", o.sr16 ? "cut at 8 kHz" : "");
+      const x0 = 12 * u, ww = w - 15 * u, hh = 37 * u;
+      for (const [im, y, lab] of [[before, 14 * u, "recorded"], [after, 57 * u, "kept"]] as const) {
+        if (im) blit(g, im, x0, y, ww, hh);
+        freqTicks(g, x0, y, hh, 24000, u);
+        screenText(g, lab, x0 + 2 * u, y + 5 * u, 4.6 * u, S.ink);
         const p = audio.position();
-        if (p >= 0 && audio.playing) { const px = x0 + (p / audio.duration) * ww; g.fillStyle = PALETTE.orange; g.fillRect(px - 1, y0, 2, hh); }
-        const chans = which === "a" ? (audio.clip.channels[0] === audio.clip.channels[1] ? "mono" : "stereo") : opts.mono ? "mono" : "stereo";
-        label(g, chans, w - 10, 16, { align: "right", size: 10.5, color: chans === "stereo" ? PALETTE.tealDeep : PALETTE.red, weight: 700 });
+        if (p >= 0 && audio.playing) { g.fillStyle = S.orange; g.fillRect(x0 + (p / audio.duration) * ww, y, 0.5 * u, hh); }
       }
-      // ladder
-      {
-        const { g, w, h } = L;
-        g.clearRect(0, 0, w, h);
-        const rungs: [string, number, boolean][] = [
-          ["48 k · 24-bit · stereo", 48000 * 24 * 2, false],
-          ["48 k · 16-bit · mono", 48000 * 16, opts.mono],
-          ["16 k · 16-bit · mono", 16000 * 16, opts.mono && opts.sr16],
-          ["log-mel 80 × 100/s (f32)", 80 * 100 * 32, opts.mel],
-          ["Whisper enc. 1280 × 50/s (f16)", 1280 * 50 * 16, false],
-          ["Mimi tokens 8 × 12.5/s", 1100, false],
-          ["HuBERT units 50/s", 50 * Math.log2(500), false],
-          ["The transcript", 50, false],
-        ];
-        const y0 = 30, rh = Math.min(30, (h - y0 - 8) / rungs.length);
-        const lo = Math.log10(30), hi = Math.log10(2.5e6);
-        rungs.forEach(([name, bps, on], i) => {
-          const y = y0 + i * rh;
-          const bw = ((Math.log10(bps) - lo) / (hi - lo)) * (w - 20);
-          roundRect(g, 10, y + 12, Math.max(4, bw), rh - 16, 3);
-          g.fillStyle = on ? PALETTE.red : i >= 5 ? PALETTE.tealSoft : PALETTE.trace; g.fill();
-          label(g, name, 10, y + 10, { size: 10.5, color: PALETTE.ink, weight: 600 });
-          label(g, fmtBits(bps), w - 10, y + 10, { align: "right", size: 10, mono: true, color: PALETTE.navy, weight: 400 });
-        });
-      }
+      if (o.sr16) { const yy = 57 * u + hh - melFrac(8000, 24000) * hh; g.strokeStyle = S.red; g.setLineDash([1.2 * u, 1 * u]); g.lineWidth = 0.4 * u; g.beginPath(); g.moveTo(x0, yy); g.lineTo(x0 + ww, yy); g.stroke(); g.setLineDash([]); }
     });
-    return () => { stop(); off(); A.dispose(); B.dispose(); L.dispose(); };
+    return undefined;
   },
   async run(ctx) {
-    const a = ctx.audio;
-    const c = a.clip;
+    const c = ctx.audio.clip;
     const L = c.channels[0], R = c.channels[1];
     let mid = 0, side = 0;
     for (let i = 0; i < L.length; i++) { mid += ((L[i] + R[i]) / 2) ** 2; side += ((L[i] - R[i]) / 2) ** 2; }
-    ctx.log(`stereo side energy  ${((100 * side) / (mid + side || 1)).toFixed(1)} %  (lost by mono)`, side > mid * 0.05 ? "warn" : "info");
-    const x = a.mono(c.sr);
-    const spec = magnitudes(stft(x, c.sr, 2048, 1024));
-    let tot = 0, hiE = 0;
-    const cut = Math.floor((8000 / (c.sr / 2)) * 1024);
-    for (const f of spec) for (let k = 0; k < f.length; k++) { const e = f[k] * f[k]; tot += e; if (k >= cut) hiE += e; }
-    ctx.log(`energy above 8 kHz   ${((100 * hiE) / (tot || 1)).toFixed(1)} %  (lost by 16 kHz)`, hiE > tot * 0.05 ? "warn" : "info");
-    ctx.log(`raw bits             ${fmtBits(c.sr * 24 * 2)}  →  log-mel ${fmtBits(80 * 100 * 32)}`);
-    ctx.log("computing the full speech front end + Griffin-Lim…", "dim");
-    await nextFrame();
-    const out = lossyChain(c, { mono: true, sr16: true, phase: true, mel: true, pool: false });
-    ctx.log(`rebuilt: ${out.channels[0].length} samples @ ${out.sr} Hz. Playing it now.`, "ok");
-    a.playSignal(out.channels, out.sr);
+    ctx.log(`"${c.name}"`);
+    ctx.log(`energy only in the left/right difference: ${((100 * side) / (mid + side || 1)).toFixed(1)} %  → lost by mono`, side > mid * 0.05 ? "warn" : "info");
+    const x = new Float32Array(L.length); for (let i = 0; i < L.length; i++) x[i] = (L[i] + R[i]) / 2;
+    const n = 2048, win = hann(n), acc = new Float32Array(n / 2 + 1);
+    for (let i = 0; i + n <= x.length; i += n / 2) { const m = magSpectrum(x.subarray(i, i + n), n, win); for (let k = 0; k < m.length; k++) acc[k] += m[k] * m[k]; }
+    let tot = 0, above = 0;
+    const cut = Math.floor((8000 / (c.sr / 2)) * (n / 2));
+    acc.forEach((v, k) => { tot += v; if (k >= cut) above += v; });
+    ctx.log(`energy above 8 kHz: ${((100 * above) / (tot || 1)).toFixed(1)} %  → lost at 16 kHz`, above > tot * 0.05 ? "warn" : "info");
+    ctx.log(`bits per second: ${fmtBits(c.sr * 24 * 2)} as recorded → ${fmtBits(16000 * 16)} at 16 kHz → ${fmtBits(80 * 100 * 32)} as log-mel floats`);
+    ctx.log("Same order of bits as the 16 kHz audio, but a blurrier description of the sound.", "ok");
   },
 };

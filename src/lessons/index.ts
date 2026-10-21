@@ -1,18 +1,18 @@
 import type { Lesson } from "../types";
-import { intro } from "./intro";
-import { sound, microphone, sampling, quantization } from "./capture";
-import { frames, mel, lost } from "./represent";
+import { start } from "./start";
+import { sound, microphone, sampling, bits } from "./capture";
+import { spectrum, mel, lost } from "./represent";
 import { encoder, tokens, projector } from "./encode";
-import { layers, head } from "./understand";
-import { mimi, moshi } from "./codecs";
-import { richer, landscape } from "./beyond";
+import { attention, headLesson } from "./understand";
+import { mimi, moshi } from "./talk";
+import { beyond, field, journey } from "./beyond";
 
 export const LESSONS: Lesson[] = [
-  intro,
-  sound, microphone, sampling, quantization,
-  frames, mel, lost,
+  start,
+  sound, microphone, sampling, bits,
+  spectrum, mel, lost,
   encoder, tokens, projector,
-  layers, head,
+  attention, headLesson,
   mimi, moshi,
-  richer, landscape,
+  beyond, field, journey,
 ];

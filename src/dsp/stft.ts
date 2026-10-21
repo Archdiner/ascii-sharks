@@ -1,4 +1,4 @@
-import { fft, ifft, hann } from "./fft";
+import { fft, ifft, hann, rdft, isPow2 } from "./fft";
 import { rng } from "./rand";
 
 /** Short-time Fourier transform. Frames are centred (reflect-free zero padding of n/2). */
@@ -17,16 +17,22 @@ export function stft(x: Float32Array, sr: number, nFft: number, hop: number, win
   const frames = Math.max(1, Math.floor((x.length + 2 * pad - nFft) / hop) + 1);
   const re: Float32Array[] = [], im: Float32Array[] = [];
   const off = (nFft - winLen) >> 1;
+  const bins = Math.floor(nFft / 2) + 1;
+  const pow2 = isPow2(nFft);
+  // centred frames with reflect padding at both ends (torch.stft / librosa default)
+  const at = (i: number) => {
+    if (x.length < 2) return x[0] ?? 0;
+    while (i < 0 || i >= x.length) i = i < 0 ? -i : 2 * (x.length - 1) - i;
+    return x[i];
+  };
   for (let f = 0; f < frames; f++) {
     const r = new Float32Array(nFft), i = new Float32Array(nFft);
     const start = f * hop - pad + off;
-    for (let k = 0; k < winLen; k++) {
-      const idx = start + k;
-      if (idx >= 0 && idx < x.length) r[k + off] = x[idx] * w[k];
-    }
-    fft(r, i);
-    re.push(r.slice(0, nFft / 2 + 1));
-    im.push(i.slice(0, nFft / 2 + 1));
+    for (let k = 0; k < winLen; k++) r[k + off] = at(start + k) * w[k];
+    if (pow2) fft(r, i);
+    else rdft(r.slice(), nFft, r, i);
+    re.push(r.slice(0, bins));
+    im.push(i.slice(0, bins));
   }
   return { nFft, win: winLen, hop, sr, re, im };
 }

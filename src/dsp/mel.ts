@@ -93,12 +93,22 @@ export interface LogMel {
   bank: MelBank;
 }
 
-/** Whisper's front end: 25 ms Hann window, 10 ms hop, log10 mel power, clamp to 80 dB, rescale. */
+/**
+ * Whisper's front end, step for step: 400-point Hann window and FFT (25 ms), hop 160 (10 ms),
+ * power, Slaney mel filters 0–8 kHz, log10, clamp to 8 below the max (80 dB), then (x + 4) / 4.
+ * Whisper drops the last STFT frame, so 30 s gives exactly 3000 frames.
+ */
 export function whisperLogMel(x16k: Float32Array, nMels = 80): LogMel {
-  const sr = 16000, nFft = 512, hop = 160, win = 400;
-  const s = stft(x16k, sr, nFft, hop, win);
-  const power = magnitudes(s).map((m) => m.map((v) => v * v));
-  const bank = melBank(sr, nFft, nMels, 0, 8000);
+  return logMel(x16k, 16000, nMels, 400, 160);
+}
+
+/** The same recipe at any rate / window / hop, for the pipeline settings. */
+export function logMel(x: Float32Array, sr: number, nMels: number, win: number, hop: number): LogMel {
+  // exact-length DFT for short windows (Whisper's 400); zero-pad long ones to a power of two for speed
+  const nFft = win <= 512 ? win : 2 ** Math.ceil(Math.log2(win));
+  const s = stft(x, sr, nFft, hop, win);
+  const power = magnitudes(s).slice(0, -1).map((m) => m.map((v) => v * v));
+  const bank = melBank(sr, nFft, nMels, 0, sr / 2);
   const mel = toMel(power, bank, true);
   const raw = mel.map((f) => f.map((v) => Math.log10(Math.max(v, 1e-10))));
   let max = -Infinity;

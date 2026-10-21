@@ -114,3 +114,19 @@ export function pca2(data: Vec[]) {
     return [a, b];
   };
 }
+
+/** Encode data with already-trained residual codebooks. */
+export function rvqEncode(data: Vec[], books: Vec[][]) {
+  const dim = data[0]?.length ?? 0;
+  const codes = books.map(() => new Int32Array(data.length));
+  const recon = data.map(() => new Float32Array(dim));
+  data.forEach((v, i) => {
+    const res = v.slice();
+    books.forEach((book, s) => {
+      const j = nearest(res, book);
+      codes[s][i] = j;
+      for (let d = 0; d < dim; d++) { recon[i][d] += book[j][d]; res[d] -= book[j][d]; }
+    });
+  });
+  return { codes, recon };
+}

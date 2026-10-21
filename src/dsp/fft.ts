@@ -69,4 +69,33 @@ export function magSpectrum(frame: ArrayLike<number>, nFft: number, win?: Float3
   return out;
 }
 
+const dftCache = new Map<number, { cos: Float64Array; sin: Float64Array }>();
+
+/**
+ * Direct DFT of a real frame for lengths that aren't powers of two (Whisper uses 400).
+ * O(n²), fine for n of a few hundred. Writes bins 0..n/2 into re/im.
+ */
+export function rdft(x: ArrayLike<number>, n: number, re: Float32Array, im: Float32Array) {
+  let t = dftCache.get(n);
+  if (!t) {
+    const cos = new Float64Array(n), sin = new Float64Array(n);
+    for (let i = 0; i < n; i++) { cos[i] = Math.cos((2 * Math.PI * i) / n); sin[i] = Math.sin((2 * Math.PI * i) / n); }
+    t = { cos, sin };
+    dftCache.set(n, t);
+  }
+  const half = Math.floor(n / 2);
+  for (let k = 0; k <= half; k++) {
+    let a = 0, b = 0, idx = 0;
+    for (let i = 0; i < n; i++) {
+      const v = x[i];
+      if (v !== 0) { a += v * t.cos[idx]; b -= v * t.sin[idx]; }
+      idx += k;
+      if (idx >= n) idx -= n;
+    }
+    re[k] = a; im[k] = b;
+  }
+}
+
+export const isPow2 = (n: number) => (n & (n - 1)) === 0;
+
 export const nextPow2 = (n: number) => 2 ** Math.ceil(Math.log2(Math.max(2, n)));

@@ -2,42 +2,41 @@ import "./style.css";
 import { audio } from "./audio/engine";
 import { SPECIMENS } from "./audio/specimens";
 import { el } from "./ui/dom";
+import { icon } from "./ui/icons";
 import { highlight } from "./ui/code";
-import { RAIL, type Ctx, type Lesson, type LogKind } from "./types";
+import { Callouts } from "./ui/callouts";
+import { World } from "./scene/world";
+import { buildAll, ORDER } from "./scene/stations";
+import { bus } from "./scene/bus";
+import type { Draw } from "./scene/screen";
+import { getPipe, setPipe, onPipe, describe } from "./pipeline";
+import { analyse, feedScene, sharedBooks, labelLogits, type Analysis } from "./analysis";
+import type { Ctx, Lesson, LogKind, Callout } from "./types";
 import { LESSONS } from "./lessons";
 
 const COURSE = LESSONS.filter((l) => !l.intro);
-const STORE = "hcl-progress-v1";
+const STORE = "hcl-progress-v2";
+const done: Set<string> = (() => { try { return new Set(JSON.parse(localStorage.getItem(STORE) ?? "[]")); } catch { return new Set(); } })();
+const saveDone = () => { try { localStorage.setItem(STORE, JSON.stringify([...done])); } catch { /* private mode */ } };
 
-function loadDone(): Set<string> {
-  try { return new Set(JSON.parse(localStorage.getItem(STORE) ?? "[]")); } catch { return new Set(); }
-}
-function saveDone() {
-  try { localStorage.setItem(STORE, JSON.stringify([...done])); } catch { /* private mode */ }
-}
-const done = loadDone();
-
-const icon = (d: string, cls = "") => `<svg viewBox="0 0 32 32" class="${cls}" aria-hidden="true">${d}</svg>`;
-const ICONS = {
-  home: icon('<path d="M16 4.2 3.6 15.1c-.7.6-.3 1.7.6 1.7H6v9.4c0 1 .8 1.8 1.8 1.8h5.4v-7.3h5.6V28h5.4c1 0 1.8-.8 1.8-1.8v-9.4h1.8c.9 0 1.3-1.1.6-1.7z"/>', "fill"),
-  lessons: icon('<path d="M16 9.2C13.4 7.3 9.6 6.6 5 6.8v17.6c4.6-.2 8.4.5 11 2.4 2.6-1.9 6.4-2.6 11-2.4V6.8c-4.6-.2-8.4.5-11 2.4zM16 9.2v17.6"/><path d="M3 9.4v17.4c5-.4 9.6.2 13 2.2 3.4-2 8-2.6 13-2.2V9.4"/>'),
-  sounds: icon('<path d="M4 16h2M8 11v10M12 7v18M16 12v8M20 5v22M24 10v12M28 16h0"/>'),
-  map: icon('<circle cx="7" cy="9" r="3"/><circle cx="25" cy="9" r="3"/><circle cx="16" cy="23" r="3"/><path d="M10 9h12M8.5 11.6 14 20.5M23.5 11.6 18 20.5"/>'),
-  settings: icon('<path d="M18.3 3.5h-4.6l-.7 3.4a9.7 9.7 0 0 0-2.6 1.5L7.1 7.3 4.8 11.2l2.6 2.3a9.9 9.9 0 0 0 0 3l-2.6 2.3 2.3 3.9 3.3-1.1c.8.6 1.7 1.1 2.6 1.5l.7 3.4h4.6l.7-3.4c.9-.4 1.8-.9 2.6-1.5l3.3 1.1 2.3-3.9-2.6-2.3a9.9 9.9 0 0 0 0-3l2.6-2.3-2.3-3.9-3.3 1.1c-.8-.6-1.7-1.1-2.6-1.5zM16 11.2a4.8 4.8 0 1 1 0 9.6 4.8 4.8 0 0 1 0-9.6z"/>', "fill"),
-};
 const LOGO = `<svg class="brand-logo" viewBox="0 0 92 50" aria-hidden="true"><path class="loop" d="M4 25h8l4-12 6 26 6-34 6 38 6-30 6 20 4-8h8"/><path class="sign" d="M66 13c8 0 14 5 14 12s-6 12-14 12M70 19c4 0 6 3 6 6s-2 6-6 6"/></svg>`;
+const NAV = (name: string, ic: string, label: string, href = "#") => `<li><a href="${href}" data-nav="${name}" title="${label}">${icon(ic)}<span class="side-label">${label}</span></a></li>`;
 
 // ---------------------------------------------------------------- layout
 
 const app = document.getElementById("app")!;
 app.innerHTML = `
+  <div class="loader" id="loader" role="status" aria-live="polite">
+    <div class="loader-inner">${LOGO}<p class="loader-title">How Computers Listen</p>
+      <div class="loader-track"><span class="loader-fill" id="loader-fill"></span></div><p class="loader-step" id="loader-step">Building the machine</p></div>
+  </div>
   <nav class="sidebar" aria-label="Main">
     <ul class="side-nav">
-      <li><a href="#intro" data-nav="home" title="Home">${ICONS.home}<span class="side-label">Home</span></a></li>
-      <li><a href="#" data-nav="lessons" title="Lessons">${ICONS.lessons}<span class="side-label">Lessons</span></a></li>
-      <li><a href="#" data-nav="sounds" title="Sounds">${ICONS.sounds}<span class="side-label">Sounds</span></a></li>
-      <li><a href="#landscape" data-nav="map" title="Landscape">${ICONS.map}<span class="side-label">Landscape</span></a></li>
-      <li class="is-muted"><a href="#" data-nav="settings" title="Settings">${ICONS.settings}<span class="side-label">Settings</span></a></li>
+      ${NAV("home", "target", "Home", "#intro")}
+      ${NAV("lessons", "book", "Lessons")}
+      ${NAV("sounds", "wave", "Sounds")}
+      ${NAV("voice", "mic", "Your voice, end to end", "#journey")}
+      ${NAV("settings", "knob", "Settings")}
     </ul>
   </nav>
   <aside class="flyout" id="flyout" aria-live="polite"></aside>
@@ -45,15 +44,12 @@ app.innerHTML = `
   <header class="brand">
     ${LOGO}
     <span class="brand-rule" aria-hidden="true"></span>
-    <div class="brand-text">
-      <h1>How Computers Listen</h1>
-      <p>Capture <i>·</i> Represent <i>·</i> Understand</p>
-    </div>
+    <div class="brand-text"><h1>How Computers Listen</h1><p>Capture <i>·</i> Represent <i>·</i> Understand</p></div>
   </header>
 
   <section class="status" aria-label="Progress">
     <div class="progress-card">
-      ${ICONS.lessons.replace('class=""', 'class="progress-icon"')}
+      ${icon("book", "progress-icon")}
       <div class="progress-body">
         <span class="progress-label" id="progress-label">Capture</span>
         <div class="progress-row">
@@ -62,31 +58,38 @@ app.innerHTML = `
         </div>
       </div>
     </div>
-    <div class="rate-card" title="How much data flows through this point in the pipeline">
-      <span class="rate-label">Data rate here</span>
-      <b id="rate-value">—</b>
-      <small id="rate-note"></small>
+    <div class="mini-card" title="How much data flows through this point of the pipeline">
+      <span class="mini-label">Data rate here</span><b id="rate-value">—</b><small id="rate-note"></small>
     </div>
-    <time class="clock" id="clock"><span id="clock-date"></span><span id="clock-time"></span></time>
+    <button class="mini-card mini-pipe" id="pipe-card" type="button" title="Your pipeline settings. Lessons change these; the end-to-end view uses them.">
+      <span class="mini-label">Your pipeline ›</span><b id="pipe-value"></b>
+    </button>
   </section>
 
   <main class="stage" id="stage">
-    <ol class="rail" id="rail" aria-label="Pipeline"></ol>
-    <div class="stage-head">
-      <span class="kicker" id="kicker"></span>
-      <h2 id="lesson-title"></h2>
-      <p id="lesson-blurb"></p>
+    <div class="world" id="world"></div>
+    <div class="viewbar" id="viewbar" role="toolbar" aria-label="Sound and view"></div>
+    <section class="inspector" id="inspector" hidden>
+      <header><span id="insp-title">Monitor</span><button class="insp-btn" id="insp-big" title="Enlarge" aria-label="Enlarge">${icon("screen")}</button></header>
+      <canvas id="insp-canvas"></canvas>
+    </section>
+    <div class="screen-view" id="screen-view" hidden>
+      <header><b id="sv-title">Screen</b><button class="sv-close" id="sv-close" aria-label="Close">${icon("cut")}</button></header>
+      <canvas id="sv-canvas"></canvas>
     </div>
-    <div class="viz" id="viz"></div>
-    <div class="viewbar" id="viewbar" role="toolbar" aria-label="Audio source"></div>
   </main>
 
-  <section class="info-card" aria-label="Lesson information">
+  <section class="info-card" aria-label="Lesson">
     <div class="tabs" role="tablist" id="tabs"></div>
-    <div class="info-body" role="tabpanel" id="info-body"></div>
+    <div class="info-body" id="info-body">
+      <div class="pane pane-overview" id="pane-overview"></div>
+      <div class="pane" id="pane-steps" hidden></div>
+      <div class="pane pane-lost" id="pane-lost" hidden></div>
+      <div class="pane" id="pane-specs" hidden></div>
+    </div>
     <div class="info-foot">
-      <button class="btn-ghost" id="prev" type="button" aria-label="Previous lesson">← Prev</button>
-      <button class="btn-next" id="next" type="button">Next lesson →</button>
+      <button class="btn-ghost" id="prev" type="button">← Prev</button>
+      <button class="btn-next" id="next" type="button">Next →</button>
     </div>
   </section>
 
@@ -94,25 +97,15 @@ app.innerHTML = `
     <header>
       <h2>Try it yourself</h2>
       <div class="code-actions">
-        <button class="btn-ghost btn-copy" id="copy" aria-label="Copy code" title="Copy code">
-          <svg viewBox="0 0 24 24"><rect x="8" y="8" width="11.5" height="12.5" rx="1.6"/><path d="M15.5 5.2V4.8c0-.9-.7-1.6-1.6-1.6H6.1c-.9 0-1.6.7-1.6 1.6v9.6c0 .9.7 1.6 1.6 1.6h.4"/></svg>
-        </button>
-        <button class="btn-run" id="run" aria-label="Run on your audio" title="Run on your audio (R)">
-          <svg viewBox="0 0 24 24"><path d="M7.5 4.8v14.4L19 12z" class="fill"/></svg>
-        </button>
+        <button class="btn-ghost btn-icon" id="copy" aria-label="Copy code" title="Copy code"><svg viewBox="0 0 24 24"><rect x="8" y="8" width="11.5" height="12.5" rx="1.6"/><path d="M15.5 5.2V4.8c0-.9-.7-1.6-1.6-1.6H6.1c-.9 0-1.6.7-1.6 1.6v9.6c0 .9.7 1.6 1.6 1.6h.4"/></svg></button>
+        <button class="btn-run" id="run" aria-label="Run on the current sound" title="Run on the current sound (R)"><svg viewBox="0 0 24 24"><path d="M7.5 4.8v14.4L19 12z" class="fill"/></svg></button>
       </div>
     </header>
     <div class="code-wrap">
       <pre class="code"><code id="code"></code></pre>
       <div class="console">
-        <div class="console-head">
-          <span class="console-dot"></span>
-          <span class="console-title">Signal monitor</span>
-          <span class="console-status" id="console-status">Stopped</span>
-          <button class="console-close" id="console-clear" aria-label="Clear monitor" title="Clear">
-            <svg viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></svg>
-          </button>
-        </div>
+        <div class="console-head"><span class="console-dot"></span><span class="console-title">Signal monitor</span><span class="console-status" id="console-status">Stopped</span>
+          <button class="console-close" id="console-clear" aria-label="Clear" title="Clear"><svg viewBox="0 0 24 24"><path d="m7 7 10 10M17 7 7 17"/></svg></button></div>
         <div class="console-lines" id="console" aria-live="polite"></div>
       </div>
     </div>
@@ -120,84 +113,226 @@ app.innerHTML = `
 
   <section class="lessons" aria-label="Lessons">
     <h2>Lessons</h2>
-    <ol class="lesson-list" id="lesson-list"></ol>
+    <div class="strip"><button class="strip-nav" id="strip-prev" aria-label="Scroll lessons left">‹</button><ol class="lesson-list" id="lesson-list"></ol><button class="strip-nav" id="strip-next" aria-label="Scroll lessons right">›</button></div>
   </section>
 `;
 
 const $ = <T extends HTMLElement = HTMLElement>(id: string) => document.getElementById(id) as T;
-const viz = $("viz");
+const stage = $("stage");
 const consoleEl = $("console");
 const codeCard = $("code-card");
+
+// ---------------------------------------------------------------- world
+
+const world = new World($("world"));
+const { all: stations } = buildAll(world);
+const callouts = new Callouts(stage, world);
+stage.append(callouts.list);
+
+// analyser → scene, every frame
+world.onTick(() => {
+  bus.live = audio.live;
+  bus.sr = audio.sampleRate;
+  if (audio.analyser && bus.live) {
+    audio.timeData(bus.time);
+    audio.freqData(bus.spec);
+    let s = 0;
+    for (let i = bus.time.length - 1024; i < bus.time.length; i++) s += bus.time[i] * bus.time[i];
+    const lv = Math.min(1, Math.sqrt(s / 1024) * 4);
+    bus.level += (lv - bus.level) * (lv > bus.level ? 0.5 : 0.1);
+  } else {
+    bus.level *= 0.9;
+  }
+  const p = audio.position();
+  bus.head = flowHead >= 0 ? flowHead : p >= 0 && audio.playing === "clip" ? p / audio.duration : -1;
+});
+
+// ---------------------------------------------------------------- analysis of the current sound
+
+let current: Lesson = LESSONS[0];
+let analysis: Analysis | null = null;
+let changeSubs: (() => void)[] = [];
+let flowHead = -1;
+
+function reanalyse() {
+  analysis = analyse(audio.clip, getPipe());
+  feedScene(analysis);
+  changeSubs.forEach((f) => f());
+  $("pipe-value").textContent = describe(getPipe());
+  const r = current.rate(getPipe());
+  $("rate-value").textContent = r.value;
+  $("rate-note").textContent = r.note;
+}
+audio.on(() => { if (!analysis || analysis.clip !== audio.clip) reanalyse(); renderViewbar(); });
+let pipeTimer = 0;
+onPipe(() => { $("pipe-value").textContent = describe(getPipe()); clearTimeout(pipeTimer); pipeTimer = window.setTimeout(reanalyse, 140); });
 
 // ---------------------------------------------------------------- console
 
 function log(text: string, kind: LogKind = "info") {
   const now = new Date();
-  const ts = `${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}.${String(Math.floor(now.getMilliseconds() / 10)).padStart(2, "0")}`;
-  const line = el("div", { class: `cl cl-${kind}` }, el("span", { class: "ts" }, ts), el("span", { class: "tx" }, text));
-  consoleEl.append(line);
+  const ts = `${String(now.getMinutes()).padStart(2, "0")}:${String(now.getSeconds()).padStart(2, "0")}`;
+  consoleEl.append(el("div", { class: `cl cl-${kind}` }, el("span", { class: "ts" }, ts), el("span", { class: "tx" }, text)));
   while (consoleEl.children.length > 200) consoleEl.firstChild?.remove();
   consoleEl.scrollTop = consoleEl.scrollHeight;
 }
-$("console-clear").addEventListener("click", () => { consoleEl.innerHTML = ""; setRunState("idle"); });
-
 function setRunState(s: "idle" | "running" | "done") {
   codeCard.dataset.state = s;
   $("console-status").textContent = s === "running" ? "Running" : s === "done" ? "Done" : "Stopped";
 }
+$("console-clear").addEventListener("click", () => { consoleEl.innerHTML = ""; setRunState("idle"); });
 
-// ---------------------------------------------------------------- lessons
+// ---------------------------------------------------------------- lesson context
 
-let current: Lesson = LESSONS[0];
-let unmount: (() => void) | null = null;
-let activeTab: keyof Lesson["tabs"] = "overview";
+const ov = $("pane-overview");
+let rowsEl: HTMLElement, statsEl: HTMLElement;
+let primary: { station: string; key: string; draw: Draw } | null = null;
+const touched = new Set<string>();
 
-const ctx: Ctx = { audio, root: viz, log, go: (id) => go(id) };
-
-function renderRail(l: Lesson) {
-  $("rail").innerHTML = RAIL.map((name, i) => `<li class="${l.rail.includes(i) ? "is-on" : ""}${l.rail.length && i < Math.min(...l.rail) ? " is-past" : ""}"><span>${name}</span></li>`).join("");
+function resolve(c: Callout) {
+  const [sid, a] = c.at.split(".");
+  const st = world.stations.get(sid)!;
+  return { anchor: st.anchors[a] ?? st.anchors.screen ?? st.group, icon: c.icon, title: c.title, text: c.text, slot: c.slot, value: c.value };
 }
 
-const TAB_NAMES: [keyof Lesson["tabs"], string][] = [["overview", "Overview"], ["hood", "Under the hood"], ["lost", "What's lost"], ["specs", "Specs"]];
+const ctx: Ctx = {
+  audio, world, log,
+  go: (id) => go(id),
+  row(ic, html, control) {
+    const text = el("div", { class: "row-text", html });
+    const r = el("div", { class: "row" }, el("span", { class: "row-ic", html: icon(ic) }), el("div", { class: "row-main" }, text, control ?? null));
+    rowsEl.append(r);
+    return { el: r, text: (h) => { text.innerHTML = h; } };
+  },
+  stat(label, cls = "") {
+    const b = el("b", {}, "—");
+    statsEl.append(el("div", { class: `stat ${cls}` }, el("small", {}, label), b));
+    return { set: (v) => { if (b.textContent !== v) b.textContent = v; } };
+  },
+  screen(sid, draw, opts = {}) {
+    const key = opts.key ?? "main";
+    const sc = world.stations.get(sid)?.screens[key];
+    if (!sc) return;
+    sc.draw = draw;
+    touched.add(`${sid}.${key}`);
+    if (draw && opts.primary !== false && (!primary || opts.primary)) primary = { station: sid, key, draw };
+    $("sv-btn")?.toggleAttribute("disabled", !primary);
+  },
+  click(sid, fn, hint) {
+    const st = world.stations.get(sid);
+    if (!st) return;
+    st.onClick = fn;
+    st.hint = hint ?? null;
+  },
+  callouts: (list) => callouts.set(list.map(resolve)),
+  focus: (ids, o) => world.focus(ids, o),
+  pipe: getPipe,
+  setPipe,
+  analysis: () => analysis ?? analyse(audio.clip, getPipe()),
+  onChange: (fn) => { changeSubs.push(fn); },
+  flow: (o) => flow(o),
+  stopFlow: () => stopFlow(),
+  expand: () => openScreen(),
+  setTags: (t) => callouts.setTags(t.map((x) => ({ ...x, anchor: world.stations.get(x.station)!.anchors.tag }))),
+};
+
+// ---------------------------------------------------------------- rendering a lesson
+
+const TABS: [string, string][] = [["overview", "Overview"], ["steps", "How it works"], ["lost", "What's lost"], ["specs", "Words & specs"]];
+let activeTab = "overview";
 
 function renderTabs() {
   const tabs = $("tabs");
   tabs.innerHTML = "";
-  for (const [k, name] of TAB_NAMES) {
-    const b = el("button", { role: "tab", type: "button", class: k === activeTab ? "is-active" : "", "aria-selected": String(k === activeTab) }, name);
-    if (k === "lost") b.classList.add("tab-lost");
+  for (const [k, name] of TABS) {
+    const b = el("button", { role: "tab", type: "button", class: `${k === activeTab ? "is-active" : ""}${k === "lost" ? " tab-lost" : ""}`, "aria-selected": String(k === activeTab) }, name);
     b.addEventListener("click", () => { activeTab = k; renderTabs(); });
     tabs.append(b);
   }
-  const body = $("info-body");
-  if (activeTab === "specs") {
-    body.innerHTML = `<dl class="specs">${current.tabs.specs.map(([a, b]) => `<div><dt>${a}</dt><dd>${b}</dd></div>`).join("")}</dl>`;
-  } else {
-    body.innerHTML = current.tabs[activeTab];
-  }
-  body.querySelectorAll<HTMLAnchorElement>("a[data-go]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); go(a.dataset.go!); }));
-  body.scrollTop = 0;
+  for (const [k] of TABS) $(`pane-${k}`).hidden = k !== activeTab;
+  $("info-body").scrollTop = 0;
 }
 
-function renderLessonList() {
-  const list = $("lesson-list");
-  list.innerHTML = "";
-  COURSE.forEach((l, i) => {
-    const li = el("li", { class: `${l === current ? "is-current" : ""}${done.has(l.id) ? " is-done" : ""}` });
-    const a = el("a", { href: `#${l.id}` },
-      el("span", { class: "lesson-num" }, String(i + 1).padStart(2, "0")),
-      el("span", { class: "lesson-meta" }, el("small", {}, l.chapter), el("b", {}, l.title)),
-      el("span", { class: "lesson-check", "aria-label": done.has(l.id) ? "done" : "" }),
-    );
-    li.append(a);
-    list.append(li);
-  });
-  list.querySelector(".is-current")?.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "smooth" });
-  const n = COURSE.filter((l) => done.has(l.id)).length;
-  $("progress-count").textContent = `${n}/${COURSE.length}`;
-  $("progress-fill").style.width = `${(n / COURSE.length) * 100}%`;
-  $("progress-bar").setAttribute("aria-valuenow", String(n));
+function renderPanes(l: Lesson) {
+  const idx = COURSE.indexOf(l);
+  ov.innerHTML = "";
+  ov.append(
+    el("div", { class: "ic-head" }, el("span", { class: "kicker" }, l.intro ? "Start here" : `Lesson ${idx + 1} of ${COURSE.length} · ${l.chapter}`), el("h2", {}, l.title)),
+    el("p", { class: "summary", html: l.summary }),
+  );
+  rowsEl = el("div", { class: "rows" });
+  statsEl = el("div", { class: "stat-row" });
+  ov.append(rowsEl, statsEl);
+  $("pane-steps").innerHTML = `<h3>How it works</h3><ol class="steps">${l.steps.map((s, i) => `<li><span>${i + 1}</span><p>${s}</p></li>`).join("")}</ol>`;
+  $("pane-lost").innerHTML = `<h3>What's lost at this step</h3>${l.lost}`;
+  $("pane-specs").innerHTML =
+    (l.words.length ? `<h3>Words</h3><dl class="words">${l.words.map(([a, b]) => `<div><dt>${a}</dt><dd>${b}</dd></div>`).join("")}</dl>` : "") +
+    (l.specs.length ? `<h3>Numbers</h3><dl class="specs">${l.specs.map(([a, b]) => `<div><dt>${a}</dt><dd>${b}</dd></div>`).join("")}</dl>` : "");
+  [ov, $("pane-steps"), $("pane-lost"), $("pane-specs")].forEach((p) => p.querySelectorAll<HTMLAnchorElement>("a[data-go]").forEach((a) => a.addEventListener("click", (e) => { e.preventDefault(); go(a.dataset.go!); })));
 }
+
+let unmount: (() => void) | void;
+
+function show(l: Lesson) {
+  if (typeof unmount === "function") unmount();
+  unmount = undefined;
+  stopFlow();
+  audio.stop();
+  touched.forEach((k) => { const [sid, key] = k.split("."); const sc = world.stations.get(sid)?.screens[key]; if (sc) sc.draw = null; });
+  touched.clear();
+  stations.forEach((s) => { s.onClick = null; s.hint = null; });
+  bus.glow.clear();
+  bus.flowing.clear();
+  primary = null;
+  closeScreen();
+  insp.hidden = true;
+  changeSubs = [];
+  current = l;
+  activeTab = "overview";
+  renderPanes(l);
+  renderTabs();
+  $("code").innerHTML = highlight(l.code);
+  ($("prev") as HTMLButtonElement).disabled = l === LESSONS[0];
+  const idx = COURSE.indexOf(l);
+  $("next").textContent = idx === COURSE.length - 1 ? "Back to start ↺" : l.intro ? "Start lesson 1 →" : "Next lesson →";
+  $("progress-label").textContent = l.intro ? "Course" : l.chapter;
+  const r = l.rate(getPipe());
+  $("rate-value").textContent = r.value;
+  $("rate-note").textContent = r.note;
+  world.focus(l.focus, l.view);
+  callouts.setTags([]);
+  callouts.set(l.callouts.map(resolve));
+  consoleEl.innerHTML = "";
+  setRunState("idle");
+  log(l.intro ? "Press ▶ to see the whole pipeline's numbers for the current sound." : `Press ▶ to run this step on "${audio.clip.name}".`, "dim");
+  unmount = l.mount(ctx);
+  $("sv-btn")?.toggleAttribute("disabled", !primary);
+  showInspector();
+  // with the inspector docked on the right, slide the machine left so it stays in view
+  if (primary) resetView();
+  renderLessonList();
+  document.title = l.intro ? "How Computers Listen" : `${l.title} · How Computers Listen`;
+}
+
+function go(id: string) {
+  if (location.hash.slice(1) !== id) location.hash = id;
+  else route();
+}
+function route() {
+  const id = location.hash.slice(1);
+  const l = LESSONS.find((x) => x.id === id) ?? LESSONS[0];
+  if (l !== current || unmount === undefined) show(l);
+}
+window.addEventListener("hashchange", route);
+
+function step(d: number) {
+  const i = LESSONS.indexOf(current);
+  if (d > 0) markDone(current);
+  go((LESSONS[i + d] ?? LESSONS[d > 0 ? 0 : i]).id);
+}
+$("next").addEventListener("click", () => step(1));
+$("prev").addEventListener("click", () => step(-1));
+$("pipe-card").addEventListener("click", () => go("journey"));
 
 function markDone(l: Lesson) {
   if (l.intro || done.has(l.id)) return;
@@ -206,60 +341,11 @@ function markDone(l: Lesson) {
   renderLessonList();
 }
 
-function show(l: Lesson) {
-  unmount?.();
-  unmount = null;
-  audio.stop();
-  current = l;
-  activeTab = "overview";
-  viz.innerHTML = "";
-  viz.dataset.lesson = l.id;
-  const idx = COURSE.indexOf(l);
-  $("kicker").textContent = l.intro ? "Start here" : `Lesson ${idx + 1} · ${l.chapter}`;
-  $("lesson-title").textContent = l.title;
-  $("lesson-blurb").textContent = l.blurb;
-  $("progress-label").textContent = l.intro ? "Course" : l.chapter;
-  $("rate-value").textContent = l.rate.value;
-  $("rate-note").textContent = l.rate.note;
-  $("code").innerHTML = highlight(l.code);
-  (($("prev") as HTMLButtonElement).disabled = l === LESSONS[0]);
-  $("next").textContent = idx === COURSE.length - 1 ? "Back to start ↺" : l.intro ? "Start lesson 1 →" : "Next lesson →";
-  renderRail(l);
-  renderTabs();
-  renderLessonList();
-  consoleEl.innerHTML = "";
-  setRunState("idle");
-  log(`${l.intro ? "Ready" : `Lesson ${idx + 1}`}: ${l.title}. Press ▶ to run the code on your audio.`, "dim");
-  unmount = l.mount(ctx);
-  document.title = l.intro ? "How Computers Listen" : `${l.title} · How Computers Listen`;
-}
-
-function go(id: string) {
-  if (location.hash.slice(1) !== id) location.hash = id;
-  else route();
-}
-
-function route() {
-  const id = location.hash.slice(1);
-  const l = LESSONS.find((x) => x.id === id) ?? LESSONS[0];
-  if (l !== current || !unmount) show(l);
-}
-window.addEventListener("hashchange", route);
-
-function step(d: number) {
-  const i = LESSONS.indexOf(current);
-  if (d > 0) markDone(current);
-  const j = i + d;
-  go((LESSONS[j] ?? LESSONS[d > 0 ? 0 : i]).id);
-}
-$("next").addEventListener("click", () => step(1));
-$("prev").addEventListener("click", () => step(-1));
-
 async function run() {
   if (codeCard.dataset.state === "running") return;
   setRunState("running");
   const l = current;
-  log(`$ run ${l.id}.py`, "head");
+  log(`$ python ${l.id}.py`, "head");
   try {
     await l.run(ctx);
     if (l === current) { setRunState("done"); markDone(l); }
@@ -270,10 +356,90 @@ async function run() {
 }
 $("run").addEventListener("click", run);
 $("copy").addEventListener("click", async () => {
-  try { await navigator.clipboard.writeText(current.code); log("Copied snippet to clipboard.", "dim"); } catch { log("Clipboard not available here.", "warn"); }
+  try { await navigator.clipboard.writeText(current.code); log("Copied to clipboard.", "dim"); } catch { log("Clipboard isn't available here.", "warn"); }
 });
 
-// ---------------------------------------------------------------- source bar
+// ---------------------------------------------------------------- lesson strip with rendered pictures
+
+const thumbs = new Map<string, string>();
+function renderLessonList() {
+  const list = $("lesson-list");
+  list.innerHTML = "";
+  COURSE.forEach((l, i) => {
+    const key = l.thumb.join(",");
+    const li = el("li", { class: `${l === current ? "is-current" : ""}${done.has(l.id) ? " is-done" : ""}` });
+    li.append(el("a", { href: `#${l.id}` },
+      thumbs.get(key) ? el("img", { src: thumbs.get(key)!, alt: "" }) : el("span", { class: "thumb-ph" }),
+      el("span", { class: "lesson-meta" }, el("b", {}, `${i + 1}. ${l.short}`)),
+      el("span", { class: "lesson-chev", html: "›" }),
+    ));
+    list.append(li);
+  });
+  // centre the current card by scrolling the strip only (scrollIntoView would also scroll the page)
+  const cur = list.querySelector<HTMLElement>(".is-current");
+  if (cur) list.scrollTo({ left: cur.offsetLeft - list.clientWidth / 2 + cur.clientWidth / 2, behavior: "smooth" });
+  const n = COURSE.filter((l) => done.has(l.id)).length;
+  $("progress-count").textContent = `${n}/${COURSE.length}`;
+  $("progress-fill").style.width = `${(n / COURSE.length) * 100}%`;
+  $("progress-bar").setAttribute("aria-valuenow", String(n));
+}
+$("strip-prev").addEventListener("click", () => $("lesson-list").scrollBy({ left: -480, behavior: "smooth" }));
+$("strip-next").addEventListener("click", () => $("lesson-list").scrollBy({ left: 480, behavior: "smooth" }));
+
+// ---------------------------------------------------------------- screen view (enlarge a monitor)
+
+const sv = $("screen-view"), svCanvas = $<HTMLCanvasElement>("sv-canvas");
+let svStop: (() => void) | null = null;
+function openScreen() {
+  if (!primary) return;
+  sv.hidden = false;
+  $("sv-title").textContent = `${world.stations.get(primary.station)?.name ?? ""} screen`;
+  const g = svCanvas.getContext("2d")!;
+  let alive = true;
+  const tick = (t: number) => {
+    if (!alive || !primary) return;
+    const r = svCanvas.getBoundingClientRect();
+    const dpr = Math.min(2, devicePixelRatio || 1);
+    const w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
+    if (svCanvas.width !== w || svCanvas.height !== h) { svCanvas.width = w; svCanvas.height = h; }
+    g.save();
+    primary.draw(g, w, h, t / 1000);
+    g.restore();
+    requestAnimationFrame(tick);
+  };
+  requestAnimationFrame(tick);
+  svStop = () => { alive = false; };
+}
+function closeScreen() { sv.hidden = true; svStop?.(); svStop = null; }
+$("sv-close").addEventListener("click", closeScreen);
+
+// ---------------------------------------------------------------- inspector: the lesson's main monitor, drawn large
+
+const insp = $("inspector"), inspCanvas = $<HTMLCanvasElement>("insp-canvas");
+function showInspector() {
+  if (!primary) { insp.hidden = true; callouts.link(null, insp); return; }
+  const st = world.stations.get(primary.station)!;
+  const sc = st.screens[primary.key];
+  insp.hidden = false;
+  insp.style.setProperty("--aspect", String(sc.canvas.width / sc.canvas.height));
+  $("insp-title").textContent = `${st.name} monitor`;
+  callouts.link(st.anchors.screen ?? st.group, insp);
+}
+world.onTick((t) => {
+  if (insp.hidden || !primary) return;
+  const r = inspCanvas.getBoundingClientRect();
+  const dpr = Math.min(2, devicePixelRatio || 1);
+  const w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
+  if (w < 2 || h < 2) return;
+  if (inspCanvas.width !== w || inspCanvas.height !== h) { inspCanvas.width = w; inspCanvas.height = h; }
+  const g = inspCanvas.getContext("2d")!;
+  g.save();
+  primary.draw(g, w, h, t);
+  g.restore();
+});
+$("insp-big").addEventListener("click", () => openScreen());
+
+// ---------------------------------------------------------------- view bar: sound + camera
 
 const viewbar = $("viewbar");
 function renderViewbar() {
@@ -282,46 +448,81 @@ function renderViewbar() {
   viewbar.innerHTML = "";
   const sel = el("select", { class: "src-select", "aria-label": "Sound" },
     ...SPECIMENS.map((s) => el("option", { value: s.id, selected: c.id === s.id }, s.name)),
-    c.source !== "specimen" ? el("option", { value: c.id, selected: true }, c.name) : null,
-  );
+    c.source !== "specimen" ? el("option", { value: c.id, selected: true }, c.name) : null);
   sel.addEventListener("change", () => audio.useSpecimen(sel.value));
-  const play = el("button", { type: "button", class: `vb-btn vb-play${playing ? " is-on" : ""}`, title: "Play / stop the clip (Space)", "aria-label": playing ? "Stop clip" : "Play clip" },
-    el("span", { html: playing ? '<svg viewBox="0 0 24 24"><rect x="7" y="7" width="10" height="10" rx="1" class="fill"/></svg>' : '<svg viewBox="0 0 24 24"><path d="M8 5.5v13L18.5 12z" class="fill"/></svg>' }), playing ? "Stop" : "Play");
-  play.addEventListener("click", togglePlay);
-  const mic = el("button", { type: "button", class: `vb-btn${audio.micOn ? " is-live" : ""}`, title: "Listen to your microphone live" },
-    el("span", { html: '<svg viewBox="0 0 24 24"><rect x="9" y="3.5" width="6" height="11" rx="3"/><path d="M5.5 11.5a6.5 6.5 0 0 0 13 0M12 18v3"/></svg>' }), audio.micOn ? "Mic live" : "Mic");
-  mic.addEventListener("click", async () => {
-    try { audio.micOn ? audio.stopMic() : await audio.startMic(); } catch { log("Microphone permission was denied or unavailable.", "warn"); }
-  });
-  const rec = el("button", { type: "button", class: "vb-btn", title: "Record 4 seconds and make it the clip" },
-    el("span", { html: '<svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="5.5" class="fill rec"/></svg>' }), "Record 4 s");
-  rec.addEventListener("click", async () => {
-    rec.disabled = true;
+  const vb = (ic: string, label: string, fn: () => void, cls = "", title = label) => {
+    const b = el("button", { type: "button", class: `vb ${cls}`, title, "aria-label": title }, el("span", { html: icon(ic) }), label ? el("span", { class: "vb-t" }, label) : null);
+    b.addEventListener("click", fn);
+    return b;
+  };
+  const rec = vb("record", "Record", async () => {
+    rec.setAttribute("disabled", "");
     try {
-      log("Recording 4 s from your microphone… say something, clap, whistle.", "info");
-      await audio.record(4, (t) => { rec.lastChild!.textContent = `${Math.max(0, 4 - t).toFixed(1)} s`; });
-      log("Recorded. Your voice is now the clip every lesson uses.", "ok");
-    } catch { log("Microphone permission was denied or unavailable.", "warn"); rec.disabled = false; renderViewbar(); }
-  });
+      log("Recording 4 seconds. Say something, clap, or whistle.", "info");
+      await audio.record(4, (t) => { rec.querySelector(".vb-t")!.textContent = `${Math.max(0, 4 - t).toFixed(1)} s`; });
+      log("Recorded. Every station now shows your recording.", "ok");
+    } catch { log("The microphone isn't available (permission denied or no device).", "warn"); rec.removeAttribute("disabled"); renderViewbar(); }
+  }, "vb-rec", "Record 4 seconds and use it everywhere");
   const file = el("input", { type: "file", accept: "audio/*", class: "sr-only", id: "file-in" });
   file.addEventListener("change", async () => {
     const f = file.files?.[0];
     if (!f) return;
-    try { await audio.loadFile(f); log(`Loaded "${f.name}" (first 6 s).`, "ok"); } catch { log("Couldn't decode that file.", "warn"); }
+    try { await audio.loadFile(f); log(`Loaded "${f.name}" (first 6 seconds).`, "ok"); } catch { log("Couldn't decode that file.", "warn"); }
   });
-  const up = el("label", { class: "vb-btn", for: "file-in", title: "Use your own audio file" },
-    el("span", { html: '<svg viewBox="0 0 24 24"><path d="M12 16V5M7.5 9.5 12 5l4.5 4.5M5 19h14"/></svg>' }), "Upload");
-  const meta = el("span", { class: "vb-meta" }, `${c.name} · ${audio.duration.toFixed(1)} s · ${(c.sr / 1000).toFixed(1)} kHz · ${c.channels[0] === c.channels[1] ? "mono" : "stereo"}`);
-  viewbar.append(el("span", { class: "vb-label" }, "Sound"), sel, play, el("span", { class: "viewbar-sep" }), mic, rec, up, file, meta);
+  const up = el("label", { class: "vb", for: "file-in", title: "Use your own audio file" }, el("span", { html: icon("sheet") }));
+  viewbar.append(
+    el("span", { class: "vb-label" }, "Sound"), sel,
+    vb(playing ? "record" : "play", playing ? "Stop" : "Play", togglePlay, `vb-play${playing ? " is-on" : ""}`, "Play or stop the sound (Space)"),
+    vb("mic", audio.micOn ? "Live" : "", async () => { try { audio.micOn ? audio.stopMic() : await audio.startMic(); } catch { log("The microphone isn't available.", "warn"); } }, audio.micOn ? "is-live" : "", "Listen to your microphone live"),
+    rec, up, file,
+    el("span", { class: "vb-sep" }),
+    vb("loop", "", () => world.rotate(-45), "", "Turn left (Q)"),
+    vb("loop", "", () => world.rotate(45), "vb-flip", "Turn right (E)"),
+    vb("filter", "", () => world.zoomBy(0.8), "", "Zoom out (−)"),
+    vb("target", "", () => resetView(), "", "Reset view (0)"),
+    vb("grid", "", () => world.zoomBy(1.25), "", "Zoom in (+)"),
+    (() => { const b = vb("screen", "", openScreen, "", "Enlarge this lesson's screen"); b.id = "sv-btn"; if (!primary) b.setAttribute("disabled", ""); return b; })(),
+  );
 }
-function togglePlay() {
-  if (audio.playing) audio.stop();
-  else audio.playClip();
+function resetView() {
+  const l = current;
+  const docked = primary && window.innerWidth > 1100;
+  if (docked) world.focus(l.focus, { ...l.view, fill: (l.view?.fill ?? 0.62) * 0.86, offset: [(l.view?.offset?.[0] ?? 0) - 0.15, l.view?.offset?.[1] ?? 0] });
+  else world.focus(l.focus, l.view);
 }
-audio.on(renderViewbar);
-renderViewbar();
+function togglePlay() { if (audio.playing) audio.stop(); else audio.playClip(); }
 
-// ---------------------------------------------------------------- flyouts (sidebar)
+// ---------------------------------------------------------------- flow animation (used by Home and the end-to-end lesson)
+
+let flowToken = 0;
+function stopFlow() { flowToken++; flowHead = -1; bus.glow.clear(); bus.flowing.clear(); }
+
+/** Light the stations in order, as if the sound were travelling through the machine. */
+async function flow(opts: { tour?: boolean; per?: number; onStation?: (id: string, i: number) => void } = {}) {
+  const my = ++flowToken;
+  const stops = ORDER.filter((id) => id !== "voice");
+  const per = opts.per ?? 0.9;
+  audio.playClip();
+  for (let i = 0; i < stops.length; i++) {
+    if (my !== flowToken) return false;
+    const id = stops[i];
+    bus.glow.set(id, 1);
+    if (i > 0) bus.flowing.add(stops[i - 1]);
+    if (opts.tour) world.focus([id], { fill: 0.42, dur: 0.8 });
+    opts.onStation?.(id, i);
+    const t0 = performance.now();
+    while (performance.now() - t0 < per * 1000) {
+      if (my !== flowToken) return false;
+      if (id === "mel" || id === "tokens") flowHead = (performance.now() - t0) / (per * 1000);
+      await new Promise((r) => setTimeout(r, 30));
+    }
+    flowHead = -1;
+    bus.glow.set(id, 0.35);
+  }
+  return true;
+}
+
+// ---------------------------------------------------------------- sidebar flyouts
 
 const flyout = $("flyout");
 function openFlyout(kind: string | null, anchor?: HTMLElement) {
@@ -339,7 +540,7 @@ function openFlyout(kind: string | null, anchor?: HTMLElement) {
       flyout.append(a);
     });
   } else if (kind === "sounds") {
-    flyout.append(el("h3", {}, "Sounds"), el("p", {}, "Every lesson runs on the current clip. These are synthesised in your browser, sample by sample. Or use the mic, record yourself, or upload a file."));
+    flyout.append(el("h3", {}, "Sounds"), el("p", {}, "Every station shows the current sound. These seven are generated in your browser, sample by sample. You can also record yourself or upload a file."));
     for (const s of SPECIMENS) {
       const b = el("button", { type: "button", class: `fly-sound${audio.clip.id === s.id ? " is-current" : ""}` }, el("b", {}, s.name), el("small", {}, s.note));
       b.addEventListener("click", () => { audio.useSpecimen(s.id); audio.playClip(); openFlyout(null); });
@@ -348,45 +549,69 @@ function openFlyout(kind: string | null, anchor?: HTMLElement) {
   } else if (kind === "settings") {
     flyout.append(el("h3", {}, "Settings"));
     const reset = el("button", { type: "button", class: "btn" }, "Reset progress");
-    reset.addEventListener("click", () => { done.clear(); saveDone(); renderLessonList(); openFlyout(null); log("Progress reset.", "dim"); });
-    flyout.append(el("p", {}, "Progress is kept in this browser only."), reset,
-      el("p", { class: "fly-keys", html: "<b>Keys</b><br><kbd>Space</kbd> play / stop · <kbd>R</kbd> run · <kbd>←</kbd> <kbd>→</kbd> lessons" }));
+    reset.addEventListener("click", () => { done.clear(); saveDone(); renderLessonList(); openFlyout(null); });
+    const resetPipe = el("button", { type: "button", class: "btn" }, "Reset pipeline settings");
+    resetPipe.addEventListener("click", () => { setPipe({ sr: 16000, bits: 16, winMs: 25, hopMs: 10, nMels: 80, encStride: 2, pool: 2 }); openFlyout(null); });
+    flyout.append(el("p", {}, "Progress is saved in this browser only."), reset, el("p", {}, ""), resetPipe,
+      el("p", { class: "fly-keys", html: "<b>Keys</b><br><kbd>Space</kbd> play · <kbd>R</kbd> run · <kbd>←</kbd> <kbd>→</kbd> lessons<br><kbd>Q</kbd> <kbd>E</kbd> turn · <kbd>+</kbd> <kbd>−</kbd> zoom · <kbd>0</kbd> reset view<br>Drag to pan, scroll to zoom." }));
   }
   flyout.classList.add("is-open");
 }
 document.querySelectorAll<HTMLAnchorElement>(".side-nav a").forEach((a) => {
   a.addEventListener("click", (e) => {
     const k = a.dataset.nav!;
-    if (k === "home" || k === "map") { openFlyout(null); return; }
+    if (k === "home" || k === "voice") { openFlyout(null); return; }
     e.preventDefault();
     openFlyout(k, a);
   });
 });
 document.addEventListener("click", (e) => {
   if (!flyout.classList.contains("is-open")) return;
-  const t = e.target as Node;
-  if (!flyout.contains(t) && !(t as Element).closest?.(".sidebar")) openFlyout(null);
+  const t = e.target as Element;
+  if (!flyout.contains(t) && !t.closest?.(".sidebar")) openFlyout(null);
 });
-
-// ---------------------------------------------------------------- keys & clock
 
 document.addEventListener("keydown", (e) => {
   const t = e.target as HTMLElement;
   if (t.closest("input, select, textarea") || e.metaKey || e.ctrlKey || e.altKey) return;
-  if (e.key === " ") { e.preventDefault(); togglePlay(); }
-  else if (e.key === "ArrowRight") step(1);
-  else if (e.key === "ArrowLeft") step(-1);
-  else if (e.key === "r" || e.key === "R") run();
-  else if (e.key === "Escape") openFlyout(null);
+  const k = e.key;
+  if (k === " ") { e.preventDefault(); togglePlay(); }
+  else if (k === "ArrowRight") step(1);
+  else if (k === "ArrowLeft") step(-1);
+  else if (k === "r" || k === "R") run();
+  else if (k === "q" || k === "Q") world.rotate(-45);
+  else if (k === "e" || k === "E") world.rotate(45);
+  else if (k === "+" || k === "=") world.zoomBy(1.25);
+  else if (k === "-") world.zoomBy(0.8);
+  else if (k === "0") resetView();
+  else if (k === "Escape") { openFlyout(null); closeScreen(); }
 });
 
-const MONTHS = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
-function tickClock() {
-  const d = new Date();
-  $("clock-date").textContent = `${MONTHS[d.getMonth()]} ${d.getDate()}, ${d.getFullYear()}`;
-  $("clock-time").textContent = d.toTimeString().slice(0, 8);
-}
-tickClock();
-setInterval(tickClock, 1000);
+// ---------------------------------------------------------------- boot: build data and pictures behind the loader
 
-route();
+(async () => {
+  const fill = $("loader-fill"), stepEl = $("loader-step");
+  const tick = (p: number, s: string) => new Promise<void>((r) => { fill.style.width = `${p * 100}%`; stepEl.textContent = s; requestAnimationFrame(() => setTimeout(r, 0)); });
+  await document.fonts?.ready;
+  await tick(0.1, "Synthesising sounds");
+  SPECIMENS.forEach((s) => audio.specimen(s.id));
+  await tick(0.3, "Training the codebooks");
+  sharedBooks("all");
+  labelLogits(audio.clip);
+  await tick(0.55, "Listening to the first sound");
+  reanalyse();
+  await tick(0.7, "Drawing the lesson pictures");
+  world.focus(ORDER, { instant: true });
+  const keys = [...new Set(COURSE.map((l) => l.thumb.join(",")))];
+  for (let i = 0; i < keys.length; i++) {
+    thumbs.set(keys[i], world.thumbnail(keys[i].split(",")));
+    if (i % 3 === 2) await tick(0.7 + (0.3 * i) / keys.length, "Drawing the lesson pictures");
+  }
+  renderViewbar();
+  route();
+  $("loader").classList.add("is-done");
+  setTimeout(() => $("loader").remove(), 600);
+})();
+
+// test hook (development builds only): lets automated checks click 3D parts by name
+if (import.meta.env.DEV) (window as unknown as { __hcl: unknown }).__hcl = { world, project: (sid: string, a: string) => world.project(world.stations.get(sid)!.anchors[a]) };

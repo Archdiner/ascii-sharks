@@ -1,187 +1,126 @@
-import type { Lesson, Ctx } from "../types";
-import { el, surface, loop, PALETTE, label, roundRect, slider, segmented, button, controls, fmtBits, heatmap, rampColor, nextFrame } from "../ui/dom";
-import { rng, gaussian } from "../dsp/rand";
-import { pca2 } from "../dsp/vq";
-import { stat } from "./capture";
-import { mel16, melDisplay, cached, drawImage, toyCodec, toyDecode } from "./shared";
-import type { AudioEngine } from "../audio/engine";
-
-// ---------------------------------------------------------------- encoder maths (real arithmetic, untrained weights)
-
-const gelu = (x: number) => 0.5 * x * (1 + Math.tanh(0.7978845608 * (x + 0.044715 * x * x * x)));
-
-function conv1d(X: Float32Array[], cOut: number, k: number, stride: number, seed: number): Float32Array[] {
-  const cIn = X[0].length, T = X.length;
-  const r = rng(seed);
-  const scale = 1 / Math.sqrt(cIn * k);
-  const W = Array.from({ length: cOut }, () => Array.from({ length: k }, () => Float32Array.from({ length: cIn }, () => gaussian(r) * scale)));
-  const out: Float32Array[] = [];
-  for (let t = 0; t * stride < T; t++) {
-    const o = new Float32Array(cOut);
-    for (let c = 0; c < cOut; c++) {
-      let s = 0;
-      for (let j = 0; j < k; j++) {
-        const src = X[t * stride + j - (k >> 1)];
-        if (!src) continue;
-        const w = W[c][j];
-        for (let i = 0; i < cIn; i++) s += w[i] * src[i];
-      }
-      o[c] = gelu(s);
-    }
-    out.push(o);
-  }
-  return out;
-}
-
-interface EncOut { stem: Float32Array[]; att: Float32Array[]; T: number; }
-
-function encode(a: AudioEngine): EncOut {
-  return cached(`enc:${a.clip.id}`, () => {
-    const X = mel16(a).frames;
-    const h1 = conv1d(X, 64, 3, 1, 1);
-    const h2 = conv1d(h1, 64, 3, 2, 2);
-    const d = 64;
-    // sinusoidal positions, as in Whisper's encoder
-    const H = h2.map((v, t) => v.map((x, i) => x + 0.15 * (i % 2 ? Math.cos(t / 10000 ** ((i - 1) / d)) : Math.sin(t / 10000 ** (i / d)))));
-    // per-channel standardisation, then parameter-free attention: softmax(H Hᵀ / τ)
-    const mean = new Float32Array(d), sd = new Float32Array(d);
-    for (const v of H) for (let i = 0; i < d; i++) mean[i] += v[i] / H.length;
-    for (const v of H) for (let i = 0; i < d; i++) sd[i] += (v[i] - mean[i]) ** 2 / H.length;
-    const Z = H.map((v) => { const z = v.map((x, i) => (x - mean[i]) / (Math.sqrt(sd[i]) + 1e-6)); const n = Math.hypot(...z) || 1; return z.map((x) => x / n); });
-    const att = Z.map((q) => {
-      const row = new Float32Array(Z.length);
-      let mx = -Infinity;
-      for (let j = 0; j < Z.length; j++) { let s = 0; for (let i = 0; i < d; i++) s += q[i] * Z[j][i]; row[j] = s * 9; mx = Math.max(mx, row[j]); }
-      let sum = 0;
-      for (let j = 0; j < row.length; j++) { row[j] = Math.exp(row[j] - mx); sum += row[j]; }
-      for (let j = 0; j < row.length; j++) row[j] /= sum;
-      return row;
-    });
-    const stem = Z.map((z) => z.map((v) => 0.5 + v * 2.2));
-    return { stem, att, T: Z.length };
-  });
-}
+import type { Lesson } from "../types";
+import { slider, segmented, button, el } from "../ui/dom";
+import { bus } from "../scene/bus";
+import { derive } from "../pipeline";
+import { layerImage, codecCodes, CODEC_K } from "../analysis";
+import { S, head, unit, screenText, heat, blit, fmtBits, fmtN, codecError, codecDecode } from "./kit";
 
 // ---------------------------------------------------------------- 8 · encoder
 
 export const encoder: Lesson = {
   id: "encoder",
-  title: "The audio encoder",
+  short: "Encoder",
+  title: "The encoder",
   chapter: "Encode",
-  blurb: "A stack of convolutions and transformer layers turns the spectrogram into a sequence of vectors that describe what is being said, 50 per second.",
-  rail: [5],
-  rate: { value: "1.02 Mb/s", note: "1280 × 50/s · fp16 (Whisper large)" },
-  tabs: {
-    overview: `
-      <p class="lead">The <b>encoder</b> reads the log-mel spectrogram and writes a <b>sequence of vectors</b>, one per time step, each describing the sound around that moment.</p>
-      <p>In Whisper, two 1-D convolutions look at 3 frames at a time across all 80 bands. The second has <b>stride 2</b>, which halves the frame rate from 100/s to <b>50/s</b> (one vector per 20 ms). Sinusoidal position encodings are added, then <b>32 transformer blocks</b> (in large) let every frame attend to every other frame in the 30-second window.</p>
-      <p>The panels run that stem <b>on your clip</b>: the input log-mel, the 64-channel conv output, and an attention map. <b>Hover</b> any panel to pick a frame and see which other frames it attends to.</p>`,
-    hood: `
-      <p><b>What's real here:</b> the log-mel, the convolutions (3-tap kernels, GELU, stride 2), the position encodings and the attention arithmetic all run on your audio.</p>
-      <p><b>What isn't:</b> the weights. They're seeded random numbers, not trained ones, and the attention uses the features as their own queries and keys (<code>softmax(HHᵀ/τ)</code>) instead of learned projections. With no training, that still lights up frames that <i>sound alike</i>. A trained encoder learns to light up frames that <i>mean</i> alike.</p>
-      <p>Other encoders: <b>wav2vec 2.0 / HuBERT / WavLM</b> skip the spectrogram and run 7 strided convolutions directly on the 16 kHz waveform (total stride 320 → 50 Hz), trained self-supervised by predicting masked frames. <b>BEATs</b> and <b>AudioMAE</b> cut the spectrogram into 16×16 patches like a vision transformer.</p>`,
-    lost: `
-      <p class="lostline"><b>Whatever the training objective didn't need.</b> Whisper was trained to output transcripts (680k hours of them), so its deep layers keep what predicts words and drop the rest: speaker identity, emotion, background, music.</p>
-      <p>Probing studies on speech encoders find a pattern: early layers stay close to acoustics, middle layers carry phonetic and speaker information, and late layers specialise toward the objective. Which layer you tap matters.</p>
-      <p class="lostline"><b>Time:</b> 50 Hz, one vector per 20 ms. Anything faster is blurred into a single vector.</p>
-      <p class="lostline"><b>Length:</b> Whisper's encoder always sees exactly 30 s, padded or cut. Longer audio is chunked, and context across chunks is lost.</p>`,
-    specs: [
-      ["Whisper large-v3", "128 mel → 1280-d · 32 layers"],
-      ["Conv stem", "k=3 ×2, 2nd stride 2, GELU"],
-      ["Output rate", "50 Hz (20 ms) · 1500 per 30 s"],
-      ["Params (encoder)", "≈ 635 M (large)"],
-      ["wav2vec 2.0 / HuBERT", "waveform, stride 320 → 50 Hz, 768/1024-d"],
-      ["Here", "64 ch, seeded weights, τ = 1/9"],
-    ],
-  },
+  thumb: ["encoder"],
+  focus: ["encoder"],
+  view: { fill: 0.74, offset: [0, 0.03] },
+  callouts: [
+    { at: "encoder.conv", icon: "layers", title: "Convolution layers", text: "Each output looks at 3 neighbouring frames across all bands. The second layer moves 2 frames at a time.", slot: "bl" },
+    { at: "encoder.layers", icon: "arcs", title: "Attention blocks", text: "Every frame gathers information from every other frame. Whisper large has 32 of these.", slot: "tl" },
+    { at: "encoder.top", icon: "grid", title: "Plates show your sound", text: "Each plate is this sound's activations after that layer: time across, features down.", slot: "tr" },
+    { at: "encoder.screen", icon: "screen", title: "Attention map", text: "Row = a frame asking. Column = a frame it's listening to. Bright = strong.", slot: "tc" },
+  ],
+  summary: "The encoder is a neural network that reads the log-mel picture and writes a new description of the sound: one list of numbers (a <b>vector</b>) every 20 ms. Each vector describes what's happening around that moment, informed by the rest of the clip. Whisper's encoder does this with 2 convolution layers followed by 32 attention layers.",
+  steps: [
+    "Input: the log-mel picture from lesson 6. Whisper always uses exactly 30 seconds, padding with silence or cutting, so it's 80 bands × 3,000 frames.",
+    "<b>Convolution 1.</b> A small filter 3 frames wide slides along time. Whisper large has 1,280 such filters, so each frame becomes 1,280 numbers. A <b>GELU</b> step then keeps positive values and squashes negative ones toward zero.",
+    "<b>Convolution 2.</b> The same again, but with <b>stride 2</b>: the filter jumps 2 frames at a time, halving the rate from 100 to 50 vectors per second (1,500 for 30 s).",
+    "Add <b>position information</b>, a fixed pattern of sine and cosine waves, so later layers can tell frames apart by where they are.",
+    "<b>Attention blocks.</b> Each vector compares itself with every other one, takes a weighted average of the ones it matches best, then goes through a small network (an MLP). After 32 blocks, a vector's meaning depends on its context.",
+    "Output: 1,500 vectors of 1,280 numbers. A language model reads these through a projector (lesson 10); Whisper's own text decoder reads them directly.",
+    "<b>On this page</b> the arithmetic is the same and runs on your sound, at a smaller width (48 features). The weights are random numbers rather than trained ones, and attention compares frames directly. So frames that <i>sound</i> alike attend to each other. Training teaches a real encoder to group frames that <i>mean</i> alike.",
+  ],
+  lost: `<ul>
+    <li><b>Whatever the training didn't reward.</b> Whisper learned to produce transcripts, so its later layers keep what predicts words and let go of speaker identity, emotion, music and background.</li>
+    <li><b>Detail faster than 20 ms</b>, since there's one vector per 20 ms.</li>
+    <li><b>Context beyond 30 seconds.</b> Longer audio is cut into 30-second pieces that are encoded separately.</li>
+  </ul>
+  <p>Studies that probe trained speech encoders find a pattern: early layers stay close to the raw sound, middle layers carry phonetic and speaker information, and late layers specialise toward the training goal. Which layer you read from matters.</p>`,
+  words: [
+    ["Neural network", "A long chain of multiply-and-add steps whose numbers (weights) are tuned on examples."],
+    ["Weights", "The learned numbers inside a network. Whisper large has about 1.55 billion."],
+    ["Vector", "An ordered list of numbers. Here, one per 20 ms of audio."],
+    ["Convolution", "Sliding a small filter along the input and computing a weighted sum at each position."],
+    ["Stride", "How far the filter jumps each step. Stride 2 halves the number of outputs."],
+    ["GELU", "A smooth function that keeps positive numbers and pushes negatives toward zero."],
+    ["Attention", "Each position takes a weighted average of other positions, weighted by how well they match."],
+    ["Self-supervised", "Trained without labels, e.g. by predicting hidden parts of the input (wav2vec 2.0, HuBERT, WavLM)."],
+  ],
+  specs: [
+    ["Whisper large-v3 input", "128 bands × 3,000 frames"],
+    ["Conv layers", "kernel 3, ×2, second has stride 2"],
+    ["Width · depth", "1,280 features · 32 blocks"],
+    ["Output", "1,500 vectors per 30 s (50 / s)"],
+    ["Encoder size", "≈ 635 M weights"],
+    ["wav2vec 2.0 / HuBERT", "raw 16 kHz audio → 7 convs (×320) → 50 / s"],
+    ["On this page", "48 features, seeded random weights"],
+  ],
   code: `import torch, whisper
 
 model = whisper.load_model("large-v3")
-audio = whisper.pad_or_trim(whisper.load_audio("clip.wav"))   # 30 s
+audio = whisper.pad_or_trim(whisper.load_audio("clip.wav"))   # exactly 30 s
 mel = whisper.log_mel_spectrogram(audio, n_mels=128)          # (128, 3000)
 
 with torch.no_grad():
-    x = torch.nn.functional.gelu(model.encoder.conv1(mel[None]))
-    x = torch.nn.functional.gelu(model.encoder.conv2(x))   # stride 2
-    print(x.shape)                                          # (1, 1280, 1500)
-    h = model.encoder(mel[None])                            # 32 blocks
-print(h.shape)                                              # (1, 1500, 1280)`,
+    enc = model.encoder
+    x = torch.nn.functional.gelu(enc.conv1(mel[None]))       # (1, 1280, 3000)
+    x = torch.nn.functional.gelu(enc.conv2(x))               # (1, 1280, 1500) stride 2
+    h = enc(mel[None])                                        # all 32 blocks
+print(h.shape)                                                # (1, 1500, 1280)`,
+  rate: (p) => { const d = derive(p); return { value: fmtBits(d.encBps), note: `${p.encDim} × ${+d.encHz.toFixed(1)}/s × 16 bit` }; },
   mount(ctx) {
-    const { root, audio } = ctx;
-    const row = el("div", { class: "viz-row", style: "flex:1" });
-    const pIn = el("div", { class: "panel" }, el("span", { class: "panel-title" }, "1 · log-mel in · 80 × 100/s"));
-    const pSt = el("div", { class: "panel" }, el("span", { class: "panel-title" }, "2 · conv stem · 64 × 50/s"));
-    const pAt = el("div", { class: "panel" }, el("span", { class: "panel-title" }, "3 · attention · 50 × 50"));
-    row.append(pIn, pSt, pAt);
-    const table = el("div", { class: "callout", style: "font-family:var(--mono);font-size:12px;line-height:1.7" });
-    root.append(row, table);
-    const I = surface(pIn), S = surface(pSt), A = surface(pAt);
-    let enc = encode(audio), imIn = heatmap(melDisplay(mel16(audio).frames), 160), imSt = heatmap(enc.stem, 128), imAt = heatmap(enc.att.map((r) => { let m = 0; for (const v of r) m = Math.max(m, v); return r.map((v) => Math.sqrt(v / m)); }), enc.T);
-    let sel = Math.floor(enc.T * 0.4);
+    const { audio } = ctx;
+    let layer = 4, sel = -1;
+    ctx.row("layers", "<b>Stride of the second convolution.</b> Whisper uses 2. Larger strides mean fewer vectors per second and coarser timing.",
+      segmented("Stride", [["1", "1"], ["2", "2"], ["4", "4"]], String(ctx.pipe().encStride), (v) => ctx.setPipe({ encStride: Number(v) })));
+    ctx.row("grid", "<b>Layer on the monitor.</b> Compare the raw conv output with the attention blocks: patterns spread across time as layers go up.",
+      segmented("Layer", [["0", "Conv 1"], ["1", "Conv 2"], ["2", "Block 1"], ["3", "Block 2"], ["4", "Block 3"]], String(layer), (v) => (layer = Number(v))));
+    const fS = slider({ label: "Frame", min: 0, max: 1, step: 0.001, value: 0.4, fmt: (v) => `${(v * audio.duration).toFixed(2)} s`, onInput: (v) => (sel = v) });
+    ctx.row("target", "<b>Pick a frame</b> to see which other frames it attends to. While the sound plays, it follows the playhead.", fS);
+    const sIn = ctx.stat("Frames in"), sOut = ctx.stat("Vectors out"), sRate = ctx.stat("Per second"), sRf = ctx.stat("Conv reach");
+    let imgs: HTMLCanvasElement[] = [], att: HTMLCanvasElement | null = null;
     const refresh = () => {
-      enc = encode(audio);
-      imIn = heatmap(melDisplay(mel16(audio).frames), 160);
-      imSt = heatmap(enc.stem, 128);
-      imAt = heatmap(enc.att.map((r) => { let m = 0; for (const v of r) m = Math.max(m, v); return r.map((v) => Math.sqrt(v / m)); }), enc.T);
-      sel = Math.min(sel, enc.T - 1);
-      const d = audio.duration, T100 = mel16(audio).frames.length;
-      table.innerHTML = `<b>your clip, ${d.toFixed(2)} s</b><br>
-        waveform 16 kHz&nbsp;&nbsp; (${audio.mono(16000).length.toLocaleString()},)<br>
-        log-mel&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; (80, ${T100})&nbsp;&nbsp;→ Whisper pads to (80, 3000)<br>
-        conv stem&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; (${enc.T}, 64)&nbsp;&nbsp; here · (1500, 1280) in Whisper-large<br>
-        HuBERT path&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; waveform → 7 convs, stride 5·2·2·2·2·2·2 = 320 → (${Math.floor(audio.mono(16000).length / 320)}, 768)`;
+      const a = ctx.analysis();
+      imgs = a.enc.layers.map(layerImage);
+      att = heat(a.enc.att.map((r) => { let m = 0; for (const v of r) m = Math.max(m, v); return r.map((v) => Math.sqrt(v / (m || 1))); }), a.enc.T);
+      const p = ctx.pipe(), d = derive(p);
+      sIn.set(fmtN(a.mel.frames.length));
+      sOut.set(fmtN(a.enc.T));
+      sRate.set(`${+d.encHz.toFixed(1)}`);
+      // conv1 sees 3 frames; conv2 sees 3 of those, spaced by 1 → 5 frames of 10 ms plus one window
+      sRf.set(`${(5 - 1) * p.hopMs + p.winMs} ms`);
     };
     refresh();
-    const off = audio.on(refresh);
-    const pick = (s: typeof I, e: PointerEvent, scale: number) => { const r = s.canvas.getBoundingClientRect(); const u = (e.clientX - r.left - 10) / (r.width - 20); sel = Math.max(0, Math.min(enc.T - 1, Math.floor(u * enc.T * scale))); };
-    I.canvas.addEventListener("pointermove", (e) => pick(I, e, 1));
-    S.canvas.addEventListener("pointermove", (e) => pick(S, e, 1));
-    A.canvas.addEventListener("pointermove", (e) => { const r = A.canvas.getBoundingClientRect(); const u = (e.clientY - r.top - 26) / (r.height - 36); sel = Math.max(0, Math.min(enc.T - 1, Math.floor(u * enc.T))); });
-    const stop = loop(() => {
-      const p = audio.position();
-      if (p >= 0 && audio.playing === "clip") sel = Math.min(enc.T - 1, Math.floor((p / audio.duration) * enc.T));
-      const box = (s: typeof I) => ({ x: 10, y: 26, w: s.w - 20, h: s.h - 36 });
-      {
-        const { g } = I; const b = box(I);
-        g.clearRect(0, 0, I.w, I.h);
-        drawImage(g, imIn, b.x, b.y, b.w, b.h);
-        // receptive field of the selected output frame: 2 conv layers of k=3 → ±3 input frames around 2t
-        const fx = b.x + ((sel * 2 - 3) / (enc.T * 2)) * b.w, fw = (7 / (enc.T * 2)) * b.w;
-        g.strokeStyle = PALETTE.orange; g.lineWidth = 2; g.strokeRect(fx, b.y, Math.max(3, fw), b.h);
-      }
-      {
-        const { g } = S; const b = box(S);
-        g.clearRect(0, 0, S.w, S.h);
-        drawImage(g, imSt, b.x, b.y, b.w, b.h, false);
-        const fx = b.x + (sel / enc.T) * b.w;
-        g.strokeStyle = PALETTE.orange; g.lineWidth = 2; g.strokeRect(fx, b.y, Math.max(2, b.w / enc.T), b.h);
-      }
-      {
-        const { g } = A; const b = box(A);
-        g.clearRect(0, 0, A.w, A.h);
-        const side = Math.min(b.w, b.h);
-        const ax = b.x + (b.w - side) / 2;
-        drawImage(g, imAt, ax, b.y, side, side, false);
-        const ry = b.y + (sel / enc.T) * side;
-        g.strokeStyle = PALETTE.orange; g.lineWidth = 2; g.strokeRect(ax, ry, side, Math.max(2, side / enc.T));
-        label(g, "query frame →", ax - 2, ry + 4, { align: "right", size: 9.5, color: PALETTE.rust, weight: 600 });
-        label(g, "keys (all frames) →", ax + side, b.y + side + 10, { align: "right", size: 9.5, color: PALETTE.faint, weight: 600 });
-      }
+    ctx.onChange(refresh);
+    ctx.screen("encoder", (g, w, h) => {
+      const u = unit(h), a = ctx.analysis(), T = a.enc.T;
+      const pos = audio.position();
+      const f = pos >= 0 && audio.playing === "clip" ? pos / audio.duration : sel >= 0 ? sel : 0.4;
+      const q = Math.min(T - 1, Math.floor(f * T));
+      head(g, w, h, a.enc.names[layer], `frame ${q}`);
+      const side = 80 * u, ax = 4 * u, ay = 15 * u;
+      if (att) blit(g, att, ax, ay, side, side, false);
+      g.strokeStyle = S.orange; g.lineWidth = 0.5 * u; g.strokeRect(ax, ay + (q / T) * side, side, Math.max(0.6 * u, side / T));
+      screenText(g, "attention", ax, ay + side + 4 * u, 4.4 * u, S.dim);
+      const lx = ax + side + 4 * u, lw = w - lx - 4 * u;
+      if (imgs[layer]) blit(g, imgs[layer], lx, ay, lw, side, false);
+      g.fillStyle = S.orange; g.fillRect(lx + (q / T) * lw, ay, Math.max(0.5 * u, lw / T), side);
+      screenText(g, "activations: time →", lx, ay + side + 4 * u, 4.4 * u, S.dim);
     });
-    return () => { stop(); off(); I.dispose(); S.dispose(); A.dispose(); };
+    return undefined;
   },
   run(ctx) {
-    const a = ctx.audio;
-    const m = mel16(a).frames;
-    ctx.log(`log-mel      (${m.length}, 80)`);
-    const e = encode(a);
-    ctx.log(`conv1 k=3    (${m.length}, 64)  GELU`);
-    ctx.log(`conv2 k=3 s2 (${e.T}, 64)  GELU   ${(e.T / a.duration).toFixed(1)} frames/s`);
-    ctx.log(`+ sinusoidal positions, attention (${e.T} × ${e.T})`);
-    const f = Math.floor(e.T / 2);
-    const top = [...e.att[f].keys()].filter((j) => Math.abs(j - f) > 3).sort((x, y) => e.att[f][y] - e.att[f][x]).slice(0, 3);
-    ctx.log(`frame ${f} (${(f * 0.02).toFixed(2)} s) attends most to frames ${top.map((j) => `${j} (${(j * 0.02).toFixed(2)} s)`).join(", ")}`, "ok");
-    ctx.log("Untrained: it finds frames that sound alike. Training makes it find frames that mean alike.", "dim");
+    const a = ctx.analysis(), p = ctx.pipe();
+    ctx.log(`log-mel        ${p.nMels} × ${fmtN(a.mel.frames.length)}`);
+    ctx.log(`conv 1, k=3    48 × ${fmtN(a.enc.layers[0].length)}   GELU`);
+    ctx.log(`conv 2, k=3/s${p.encStride} 48 × ${fmtN(a.enc.T)}   ${(a.enc.T / (a.clip.channels[0].length / a.clip.sr)).toFixed(1)} vectors per second`);
+    ctx.log(`3 attention blocks, each ${a.enc.T} × ${a.enc.T} weights`);
+    const m = Math.floor(a.enc.T / 2), row = a.enc.att[m];
+    const top = [...row.keys()].filter((j) => Math.abs(j - m) > 2).sort((x, y) => row[y] - row[x]).slice(0, 3);
+    const s = (j: number) => ((j * p.encStride * p.hopMs) / 1000).toFixed(2);
+    ctx.log(`the vector at ${s(m)} s attends most to ${top.map((j) => `${s(j)} s`).join(", ")}`, "ok");
+    ctx.log("Untrained weights: it links frames that sound alike. Trained ones link frames that mean alike.", "dim");
   },
 };
 
@@ -189,296 +128,227 @@ print(h.shape)                                              # (1, 1500, 1280)`,
 
 export const tokens: Lesson = {
   id: "tokens",
-  title: "From vectors to tokens",
+  short: "Tokens",
+  title: "Tokens: sound as whole numbers",
   chapter: "Encode",
-  blurb: "Language models eat integers. Vector quantization snaps every frame to the nearest entry in a codebook, and residual quantization repeats that on what's left over.",
-  rail: [6],
-  rate: { value: "≈ 0.4–6 kb/s", note: "codes × log2(K) × frame rate" },
-  tabs: {
-    overview: `
-      <p class="lead">To let a language model predict audio, the way it predicts words, audio has to become a sequence of <b>integers</b>.</p>
-      <p><b>Vector quantization (VQ)</b> learns a <b>codebook</b> of <code>K</code> typical vectors. Each frame is replaced by the <i>index</i> of the nearest one. With K = 1024, every frame becomes a 10-bit number.</p>
-      <p>One codebook is coarse. <b>Residual VQ (RVQ)</b> quantizes the frame, subtracts the chosen codeword, quantizes the <i>leftover</i> with a second codebook, and so on. Each stage adds detail, like successive decimal places.</p>
-      <p>This panel trains real codebooks with k-means <b>on your clip's</b> log-mel frames. Each dot is a frame, projected to 2-D. Add stages and watch the error bars shrink, then press <b>Hear decode</b>.</p>`,
-    hood: `
-      <p>Two families of tokens:</p>
-      <ul>
-        <li><b>Semantic tokens</b>: k-means on a self-supervised encoder's features (HuBERT with K=500, w2v-BERT). They carry <i>what</i> was said, and you can't resynthesize the voice from them alone.</li>
-        <li><b>Acoustic tokens</b>: from a neural codec (SoundStream, EnCodec, DAC) trained to <i>reconstruct</i> the waveform. RVQ with 8–32 codebooks of 1024 entries.</li>
-      </ul>
-      <p>Neural codecs learn the encoder, codebooks and decoder end-to-end, with adversarial losses so the output sounds real. What runs here is k-means on mel frames, which is the same idea with no learning and a Griffin-Lim decoder. That's why it sounds rough.</p>
-      <p>Bitrate = <code>stages × log₂K × frames/s</code>. EnCodec at 24 kHz uses 75 frames/s; 8 codebooks × 10 bits × 75 = <b>6 kb/s</b>.</p>`,
-    lost: `
-      <p class="lostline"><b>Everything between codewords.</b> A frame becomes one of K possibilities. Only the codebook's typical sounds can be represented, and anything unusual gets snapped to its nearest typical neighbour.</p>
-      <p class="lostline"><b>Rare sounds.</b> Codebooks are trained on a dataset. Sounds that were rare in training (a specific instrument, an animal call, a language not in the data) are represented badly.</p>
-      <p>Dropping the later RVQ stages keeps the coarse content and loses the fine detail. That's how codecs offer several bitrates from one model.</p>`,
-    specs: [
-      ["HuBERT units", "K = 500 · 50 Hz · ≈ 450 b/s"],
-      ["EnCodec 24 kHz", "75 Hz · ≤ 32 × 1024 · 1.5–24 kb/s"],
-      ["DAC 44.1 kHz", "86 Hz · 9 × 1024 · 7.7 kb/s"],
-      ["Mimi", "12.5 Hz · 8 × 2048 · 1.1 kb/s"],
-      ["Here", "125 Hz · log-mel 80 · k-means"],
-    ],
-  },
+  thumb: ["tokens"],
+  focus: ["tokens"],
+  view: { fill: 0.74, offset: [0, 0.03] },
+  callouts: [
+    { at: "tokens.row0", icon: "cube", title: "First codebook", text: "For each 80 ms of sound, the number of the closest of 32 stored shapes.", slot: "tl" },
+    { at: "tokens.tiles", icon: "layers", title: "Later codebooks", text: "Each row encodes what the rows above it missed.", slot: "br" },
+    { at: "tokens.column", icon: "hash", title: "One column, one frame", text: "8 whole numbers describe 80 ms of sound.", slot: "bl" },
+    { at: "tokens.screen", icon: "bars", title: "Error", text: "How far the decoded spectrum is from the real one after each codebook, in decibels.", slot: "tr" },
+  ],
+  summary: "Language models are built to predict the next item in a sequence of whole numbers. To model audio the same way, each chunk of sound is replaced by the number of its closest match in a <b>codebook</b>, a fixed list of typical sounds. Several codebooks in a row, each correcting the one before, give a description that is both compact and detailed.",
+  steps: [
+    "A <b>codebook</b> is a list of K example vectors learned from data. Here K = 32; Mimi uses 2,048.",
+    "<b>Vector quantization:</b> for each frame, find the closest codebook entry and keep only its position in the list, one whole number.",
+    "Subtract that entry from the frame. What's left over is the <b>residual</b>, the part the first codebook couldn't capture.",
+    "<b>Residual vector quantization (RVQ):</b> quantize the residual with a second codebook, then the new residual with a third, and so on. Each codebook adds detail, the way decimal places do.",
+    "Cost: each number takes log₂(K) bits. Here that's 5 bits × 8 codebooks × 12.5 frames per second = 500 bits per second. Mimi: 11 × 8 × 12.5 = 1,100.",
+    "A <b>neural codec</b> (SoundStream, EnCodec, Mimi) learns the encoder, the codebooks and a decoder together, so the decoded audio sounds natural. Here the codebooks are fitted with k-means to log-mel frames of the seven built-in sounds, and decoding uses Griffin-Lim, so it sounds rough. The mechanism is the same.",
+  ],
+  lost: `<ul>
+    <li><b>Everything between codebook entries.</b> A frame becomes one of K choices, so only sounds the codebook has learned can be described well.</li>
+    <li><b>Sounds that were rare in training.</b> Switch the codebooks to <b>trained on speech only</b> and pick <i>Birdsong</i> or <i>Drum loop</i>: the error jumps from about 1 dB to well over 10 dB, because those sounds were never in the training data. (On the <i>Vowels</i> it drops to almost zero: they <i>were</i> the training data.)</li>
+    <li><b>Fine detail</b>, when later codebooks are dropped to save bits. Codecs offer several bitrates this way.</li>
+  </ul>`,
+  words: [
+    ["Codebook", "A fixed list of example vectors. Each is referred to by its position (index)."],
+    ["Vector quantization", "Replacing a vector by the index of its nearest codebook entry."],
+    ["Residual", "What's left after subtracting the chosen entry: the error so far."],
+    ["RVQ", "Residual vector quantization: several codebooks applied one after another to the remaining error."],
+    ["k-means", "A simple way to learn a codebook: repeatedly move each entry to the average of the vectors closest to it."],
+    ["Codec", "Coder–decoder: turns audio into a compact form and back."],
+    ["Bitrate", "Bits per second needed to store or send the compact form."],
+  ],
+  specs: [
+    ["Here", "32 entries × 8 codebooks, 12.5 frames/s → 500 b/s"],
+    ["Mimi", "2,048 × 8 at 12.5 frames/s → 1.1 kb/s"],
+    ["EnCodec (24 kHz)", "1,024 × up to 32 at 75/s → 1.5–24 kb/s"],
+    ["DAC (44.1 kHz)", "1,024 × 9 at 86/s → 7.7 kb/s"],
+    ["HuBERT units", "500 entries × 1 at 50/s → ≈ 450 b/s"],
+  ],
   code: `import numpy as np
 from sklearn.cluster import KMeans
 
-frames = logmel.T                       # (T, 80)
-residual, recon, codes = frames.copy(), 0, []
-for stage in range(8):                  # residual VQ
-    km = KMeans(n_clusters=64).fit(residual)
-    idx = km.predict(residual)          # one integer per frame
-    q = km.cluster_centers_[idx]
-    codes.append(idx)
-    recon = recon + q
+frames = logmel_80ms_frames                       # (T, 80)
+books, codes, recon = [], [], np.zeros_like(frames)
+for level in range(8):                            # residual VQ
     residual = frames - recon
-    print(stage + 1, "stages  mse", np.mean(residual ** 2))`,
+    km = KMeans(n_clusters=32, n_init=4).fit(residual)
+    idx = km.predict(residual)                    # one integer per frame
+    recon += km.cluster_centers_[idx]
+    books.append(km.cluster_centers_); codes.append(idx)
+    print(level + 1, "codebooks, error left:", np.mean((frames - recon) ** 2))`,
+  rate: (p) => ({ value: fmtBits(p.codecHz * 8 * Math.log2(CODEC_K)), note: `12.5 frames/s × 8 × ${Math.log2(CODEC_K)} bits` }),
   mount(ctx) {
-    const { root, audio } = ctx;
-    let K = 64, stages = 2;
-    const row = el("div", { class: "viz-row", style: "flex:1" });
-    const pS = el("div", { class: "panel", style: "flex:1.15" }, el("span", { class: "panel-title" }, "Frames (dots) and codewords (rings) · PCA"));
-    const col = el("div", { class: "viz-col", style: "flex:1" });
-    const pM = el("div", { class: "panel", style: "flex:1.2" }, el("span", { class: "panel-title" }, "Original vs decoded log-mel"));
-    const pE = el("div", { class: "panel", style: "flex:1" }, el("span", { class: "panel-title" }, "Error after each stage"));
-    col.append(pM, pE);
-    row.append(pS, col);
-    const strip = el("div", { class: "callout", style: "font-family:var(--mono);font-size:11.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis" });
-    root.append(row, strip);
-    const sBits = stat("Bits / frame"), sRate = stat("Bitrate (125 fps)"), sMse = stat("Error kept");
-    const stS = slider({ label: "RVQ stages", min: 1, max: 8, value: stages, onInput: (v) => { stages = v; } });
-    root.append(controls(
-      segmented("Codebook K", [["16", "16"], ["64", "64"], ["256", "256"]], "64", async (v) => { K = Number(v); await train(); }),
-      stS,
-      button("▶ Hear decode", async () => { ctx.log(`Decoding ${stages} stage(s) with Griffin-Lim…`, "dim"); await nextFrame(); audio.playSignal([toyDecode(codec, stages)], 16000); }, "btn primary"),
-      button("▶ Original", () => audio.playClip(), "btn"),
-    ), el("div", { class: "stat-row" }, sBits, sRate, sMse));
-    const SC = surface(pS), MM = surface(pM), EE = surface(pE);
-    let codec = toyCodec(audio, K);
-    let proj = pca2(codec.frames), pts = codec.frames.map(proj), imOrig: HTMLCanvasElement | null = null;
-    const imRec: (HTMLCanvasElement | null)[] = [];
-    let melMax = 0;
-    const scaleMel = (f: Float32Array) => f.map((v) => Math.max(0, (v - melMax + 6) / 6) * 0.96);
-    async function train() {
-      if (!codec || codec.K !== K) { strip.textContent = `training ${8} codebooks of ${K} on ${codec?.frames.length ?? "…"} frames…`; await nextFrame(); }
-      codec = toyCodec(audio, K);
-      proj = pca2(codec.frames);
-      pts = codec.frames.map(proj);
-      melMax = -Infinity;
-      for (const f of codec.frames) for (const v of f) melMax = Math.max(melMax, v);
-      imOrig = heatmap(codec.frames.map(scaleMel), 80);
-      imRec.length = 0;
-    }
-    void train();
-    const off = audio.on(() => void train());
-    const stop = loop(() => {
-      const q = codec.q;
-      const s = Math.min(stages, q.recon.length);
-      // scatter
-      {
-        const { g, w, h } = SC;
-        g.clearRect(0, 0, w, h);
-        let mnx = Infinity, mxx = -Infinity, mny = Infinity, mxy = -Infinity;
-        for (const [x, y] of pts) { mnx = Math.min(mnx, x); mxx = Math.max(mxx, x); mny = Math.min(mny, y); mxy = Math.max(mxy, y); }
-        const X = (v: number) => 16 + ((v - mnx) / (mxx - mnx || 1)) * (w - 32);
-        const Y = (v: number) => 30 + ((v - mny) / (mxy - mny || 1)) * (h - 46);
-        const recon = q.recon[s - 1];
-        const c0 = q.codes[0];
-        for (let i = 0; i < pts.length; i += 1) {
-          const [x, y] = pts[i];
-          const [rx, ry] = proj(recon[i]);
-          g.strokeStyle = "#c8553f55"; g.lineWidth = 1;
-          g.beginPath(); g.moveTo(X(x), Y(y)); g.lineTo(X(rx), Y(ry)); g.stroke();
-          g.fillStyle = rampColor(0.35 + 0.6 * ((c0[i] * 0.618) % 1));
-          g.beginPath(); g.arc(X(x), Y(y), 2.4, 0, 7); g.fill();
-        }
-        for (const c of q.books[0]) { const [x, y] = proj(c); g.strokeStyle = PALETTE.navy; g.lineWidth = 1.6; g.beginPath(); g.arc(X(x), Y(y), 5, 0, 7); g.stroke(); }
-        label(g, `stage-1 codebook: ${q.books[0].length} rings · red = error left after ${s} stage${s > 1 ? "s" : ""}`, 12, h - 6, { size: 10.5, color: PALETTE.muted, weight: 500 });
+    const { audio } = ctx;
+    let n = 8, trainOn: "all" | "speech" = "all";
+    const apply = () => {
+      bus.codes = codecCodes(audio.clip, trainOn).codes;
+      bus.codeRows = n;
+    };
+    ctx.row("layers", "<b>Codebooks used.</b> Fewer rows means fewer bits and a rougher sound. Unused rows go blank on the tray.",
+      slider({ label: "Codebooks", min: 1, max: 8, value: n, onInput: (v) => { n = v; update(); } }));
+    ctx.row("book", "<b>What the codebooks learned from.</b> The default learned from all seven built-in sounds. The other learned only from speech (the Vowels).",
+      segmented("Trained on", [["all", "All sounds"], ["speech", "Speech only"]], trainOn, (v) => { trainOn = v as "all" | "speech"; update(); }));
+    ctx.row("ear", "<b>Hear the decoded tokens.</b> The integers on the tray, turned back into sound.",
+      el("div", { class: "btns" },
+        button("▶ Hear the tokens", () => { ctx.log(`Decoding ${n} codebook${n > 1 ? "s" : ""}…`, "dim"); setTimeout(() => audio.playSignal([codecDecode(ctx.analysis(), n, trainOn)], 16000), 30); }, "btn primary"),
+        button("▶ Original", () => audio.playClip(), "btn")));
+    const sBits = ctx.stat("Bits per frame"), sRate = ctx.stat("Bits per second"), sErr = ctx.stat("Average error", "lost");
+    const update = () => {
+      apply();
+      const err = codecError(ctx.analysis(), trainOn);
+      sBits.set(String(n * Math.log2(CODEC_K)));
+      sRate.set(fmtBits(12.5 * n * Math.log2(CODEC_K)));
+      sErr.set(`${err[n - 1].toFixed(1)} dB`);
+    };
+    update();
+    ctx.onChange(update);
+    const tick = ctx.world.onTick(() => { if (bus.codeRows !== n) update(); });
+    ctx.screen("tokens", (g, w, h) => {
+      const u = unit(h), a = ctx.analysis();
+      const err = codecError(a, trainOn);
+      head(g, w, h, `Average error · trained on ${trainOn === "all" ? "all sounds" : "speech only"}`, `${err[n - 1].toFixed(1)} dB`, err[n - 1] > 6 ? S.red : S.teal);
+      const x0 = 6 * u, bw = (w * 0.55 - x0) / 8, base = 86 * u, H = 62 * u, top = Math.max(6, err[0]);
+      err.forEach((e, i) => {
+        const bh = Math.min(1, e / top) * H;
+        g.fillStyle = i < n ? (e > 6 ? S.red : S.teal) : "#2c3a5e";
+        g.fillRect(x0 + i * bw + 0.6 * u, base - bh, bw - 1.2 * u, bh);
+        screenText(g, String(i + 1), x0 + i * bw + bw / 2, base + 7 * u, 4.4 * u, S.dim, "center", true);
+      });
+      screenText(g, "codebooks used →", x0, 98 * u, 4 * u, S.dim);
+      // the current frame's codes
+      const c = bus.codes, T = c?.[0]?.length ?? 0;
+      const f = audio.position() >= 0 && audio.playing === "clip" ? Math.min(T - 1, Math.floor((audio.position() / audio.duration) * T)) : Math.floor(T / 2);
+      const cx = w * 0.6;
+      screenText(g, `frame ${f}`, cx, 22 * u, 5 * u, S.dim);
+      for (let r = 0; r < 8; r++) {
+        const v = c?.[r]?.[f];
+        g.fillStyle = r < n ? (r === 0 ? S.orange : S.ink) : "#3a4466";
+        g.font = S.mono(6.4 * u); g.textAlign = "left";
+        g.fillText(`c${r + 1}  ${v ?? "–"}`, cx, (31 + r * 7.8) * u);
       }
-      // mel compare
-      {
-        const { g, w, h } = MM;
-        g.clearRect(0, 0, w, h);
-        if (!imRec[s]) imRec[s] = heatmap(q.recon[s - 1].map(scaleMel), 80);
-        const bh = (h - 40) / 2;
-        if (imOrig) drawImage(g, imOrig, 10, 26, w - 20, bh);
-        drawImage(g, imRec[s]!, 10, 32 + bh, w - 20, bh);
-        label(g, "original", w - 14, 40, { align: "right", size: 10.5, color: "#fdf8ef", weight: 700 });
-        label(g, `${s} stage${s > 1 ? "s" : ""} · ${s * Math.log2(K)} bits/frame`, w - 14, 46 + bh, { align: "right", size: 10.5, color: "#fdf8ef", weight: 700 });
-      }
-      // error bars
-      {
-        const { g, w, h } = EE;
-        g.clearRect(0, 0, w, h);
-        const base = q.baseMse;
-        const bw = (w - 40) / 9;
-        const H = h - 52;
-        const bars = [base, ...q.mse];
-        bars.forEach((m, i) => {
-          const bh = (m / base) * H;
-          roundRect(g, 20 + i * bw + 3, 28 + H - bh, bw - 6, bh, 3);
-          g.fillStyle = i === 0 ? PALETTE.trace : i <= s ? PALETTE.teal : PALETTE.track; g.fill();
-          label(g, i === 0 ? "0" : String(i), 20 + i * bw + bw / 2, h - 10, { align: "center", size: 10, mono: true, color: PALETTE.faint, weight: 400 });
-        });
-      }
-      const bits = s * Math.log2(K);
-      sBits.set(`${bits}`);
-      sRate.set(fmtBits(bits * 125));
-      sMse.set(`${((100 * q.mse[s - 1]) / q.baseMse).toFixed(1)} %`);
-      const ids = Array.from({ length: Math.min(s, 4) }, (_, k) => `c${k + 1}: ${Array.from(q.codes[k].subarray(0, 40)).join(" ")}`);
-      strip.textContent = ids.join("   ");
     });
-    return () => { stop(); off(); SC.dispose(); MM.dispose(); EE.dispose(); };
+    return () => { tick(); bus.codeRows = 8; bus.codes = ctx.analysis().codes; };
   },
-  async run(ctx) {
-    const a = ctx.audio;
-    for (const K of [16, 64, 256]) {
-      ctx.log(`training RVQ, K=${K}…`, "dim");
-      await nextFrame();
-      const c = toyCodec(a, K);
-      ctx.log(`K=${String(K).padStart(3)}  ` + c.q.mse.map((m, i) => `${i + 1}:${((100 * m) / c.q.baseMse).toFixed(0)}%`).join(" "));
+  run(ctx) {
+    const a = ctx.analysis();
+    for (const t of ["all", "speech"] as const) {
+      const err = codecError(a, t);
+      ctx.log(`trained on ${t === "all" ? "all sounds " : "speech only"}: average error after 1…8 codebooks (dB)  ${err.map((e) => e.toFixed(1)).join("  ")}`, t === "speech" && err[7] > 6 ? "warn" : "info");
     }
-    const c = toyCodec(a, 64);
-    ctx.log(`first frames, codebook 1: [${Array.from(c.q.codes[0].subarray(0, 16)).join(", ")}, …]`, "ok");
-    ctx.log("Each list of integers is now something a language model could learn to predict.", "dim");
+    const c = codecCodes(a.clip);
+    ctx.log(`first 12 frames, codebook 1: [${c.codes[0].slice(0, 12).join(", ")}]`);
+    ctx.log(`${c.codes[0].length} frames × 8 codebooks = ${c.codes[0].length * 8} integers for ${(a.clip.channels[0].length / a.clip.sr).toFixed(1)} s of sound`, "ok");
   },
 };
 
 // ---------------------------------------------------------------- 10 · projector
 
-type ProjMode = "stack" | "qformer" | "codes";
+type Conn = "stack" | "qformer" | "codes";
+const CONN_TEXT: Record<Conn, string> = {
+  stack: "<b>Stack + MLP:</b> join k neighbouring vectors end to end and resize them with a two-layer network. Used by Qwen2-Audio (k = 2, 25 tokens per second) and many others.",
+  qformer: "<b>Q-Former:</b> a small transformer with a few learned \"query\" vectors that read the encoder output and summarise it. SALMONN uses one query per 17 frames, about 3 tokens per second.",
+  codes: "<b>Codec tokens:</b> no projector. The language model's vocabulary is extended with codebook entries, each with its own learned vector. Moshi adds up the vectors for the 8 codes of each frame: 12.5 inputs per second.",
+};
 
 export const projector: Lesson = {
   id: "projector",
-  title: "The projector: audio into the LM",
+  short: "Projector",
+  title: "The projector: audio into the language model",
   chapter: "Encode",
-  blurb: "An adapter reshapes encoder output into vectors the size of a word embedding and slips them into the prompt. Its pooling factor decides how many tokens a second of audio costs.",
-  rail: [7],
-  rate: { value: "25 tok/s", note: "× 4096-d (Qwen2-Audio-style)" },
-  tabs: {
-    overview: `
-      <p class="lead">A language model reads a sequence of <b>embeddings</b>, one per token, each a vector of maybe 4,096 numbers. Encoder output doesn't fit: wrong size, and too many per second.</p>
-      <p>The <b>projector</b> (also called an adapter or connector) fixes both. The most common design:</p>
-      <ul>
-        <li><b>Stack</b> or pool <code>k</code> neighbouring encoder frames into one (50 Hz → 50/k Hz).</li>
-        <li>Push the result through a small <b>MLP</b> into the LM's embedding size.</li>
-        <li>Put the resulting "audio tokens" into the prompt between markers, next to ordinary text tokens.</li>
-      </ul>
-      <p>The LM is then fine-tuned (often with the encoder frozen) on audio-text pairs. Drag <b>k</b> and watch the token budget change.</p>`,
-    hood: `
-      <p>Three ways in:</p>
-      <ul>
-        <li><b>Pool + MLP</b>: LLaVA-style. Qwen2-Audio pools Whisper's 50 Hz output by 2 → <b>25 tokens/s</b>. Ultravox, LLaMA-Omni and others stack frames and use a 2-layer MLP.</li>
-        <li><b>Q-Former</b>: a small transformer with a few learned query vectors that cross-attend to the encoder output and summarize it. SALMONN uses one query per ≈0.33 s window, over Whisper + BEATs features.</li>
-        <li><b>Discrete codes</b>: no projector at all. The LM's vocabulary is extended with codec tokens, and each token gets an embedding row like any word. Moshi sums the embeddings of all codebooks in a frame into one input vector per 80 ms step.</li>
-      </ul>`,
-    lost: `
-      <p class="lostline"><b>Temporal detail, again.</b> Pooling by k averages k frames. At 25 Hz, each audio token covers 40 ms; Q-Formers compress further.</p>
-      <p class="lostline"><b>What the adapter wasn't trained on.</b> The projector and LM learn from paired data, mostly ASR transcripts and audio captions. If no training example ever asked about reverb, pitch or a cough, those features may reach the LM but go unused.</p>
-      <p>The budget matters too. An hour at 25 tokens/s is 90,000 tokens, most of a 128k context. That's why long-audio understanding is still hard.</p>`,
-    specs: [
-      ["Qwen2-Audio", "Whisper-large-v3 · pool 2 · 25 Hz"],
-      ["SALMONN", "Whisper + BEATs · window Q-Former"],
-      ["Ultravox", "Whisper enc · stack 8 · MLP"],
-      ["Moshi", "sum of 8 codebook embeddings · 12.5 Hz"],
-      ["LM width", "3584 (Qwen2-7B) · 4096 (Llama-3-8B)"],
-    ],
-  },
+  thumb: ["projector"],
+  focus: ["projector"],
+  view: { fill: 0.74, offset: [0, 0.03] },
+  callouts: [
+    { at: "projector.in", icon: "grid", title: "Encoder vectors in", text: "50 per second, 1,280 numbers each (Whisper large).", slot: "br" },
+    { at: "projector.mlp", icon: "funnel", title: "Stack and resize", text: "k neighbours are joined, then a small network maps them to the language model's width.", slot: "tl" },
+    { at: "projector.out", icon: "cube", title: "Audio tokens out", text: "Same size as a word's vector, so the model reads them like words.", slot: "bl" },
+    { at: "projector.screen", icon: "screen", title: "Token budget", text: "How much of the model's context the audio uses up.", slot: "tr" },
+  ],
+  summary: "A language model reads one vector per token, all the same size: 3,584 numbers for Qwen2-7B, for example. Encoder output has the wrong size and arrives too often. The <b>projector</b> (also called an adapter) fixes both. Its pooling setting decides how many tokens each second of audio costs.",
+  steps: [
+    "Take k neighbouring encoder vectors and join them end to end: with k = 2, two 1,280-number vectors become one of 2,560.",
+    "A small network of two layers (an <b>MLP</b>) maps that to the language model's width, e.g. 3,584.",
+    "The results are placed in the prompt between markers such as &lt;audio&gt; and &lt;/audio&gt;, next to ordinary text tokens such as \"What is this sound?\"",
+    "Training usually freezes the encoder, trains the projector first, then fine-tunes the language model on pairs of audio and text.",
+    "The pooling factor sets the cost. Qwen2-Audio pools by 2 → 25 tokens per second → 90,000 tokens for an hour, most of a 128,000-token context.",
+  ],
+  lost: `<ul>
+    <li><b>Timing finer than one token.</b> At 25 tokens per second, each token covers 40 ms of sound.</li>
+    <li><b>What the projector wasn't trained to pass on.</b> It learns from paired data, mostly transcripts and short sound captions. A feature no training example asked about can reach the model and still go unused.</li>
+    <li><b>Long recordings,</b> which run out of context.</li>
+  </ul>`,
+  words: [
+    ["Embedding", "The vector a language model uses for one token."],
+    ["Projector / adapter", "A small network that converts one model's vectors into another's format."],
+    ["MLP", "Multi-layer perceptron: a few layers of multiply-add plus a nonlinearity."],
+    ["Pooling", "Combining several neighbouring vectors into one."],
+    ["Context window", "The most tokens a model can read at once, e.g. 128,000."],
+    ["Prompt", "Everything the model reads before it starts answering."],
+  ],
+  specs: [
+    ["Qwen2-Audio", "Whisper-large-v3 encoder, pool 2 → 25 / s"],
+    ["SALMONN", "Whisper + BEATs, window Q-Former → ≈ 3 / s"],
+    ["Moshi", "8 code vectors summed per 80 ms → 12.5 / s"],
+    ["LM width", "3,584 (Qwen2-7B) · 4,096 (Llama-3-8B, Helium)"],
+  ],
   code: `import torch, torch.nn as nn
 
 class Projector(nn.Module):
-    def __init__(self, d_enc=1280, d_lm=4096, k=2):
+    def __init__(self, d_enc=1280, d_lm=3584, k=2):
         super().__init__()
         self.k = k
-        self.mlp = nn.Sequential(nn.Linear(d_enc * k, d_lm),
-                                 nn.GELU(), nn.Linear(d_lm, d_lm))
-    def forward(self, h):                       # (B, T, 1280) at 50 Hz
-        B, T, D = h.shape
-        h = h[:, : T // self.k * self.k].reshape(B, T // self.k, D * self.k)
-        return self.mlp(h)                      # (B, T/k, 4096)
+        self.mlp = nn.Sequential(nn.Linear(d_enc * k, d_lm), nn.GELU(), nn.Linear(d_lm, d_lm))
 
-audio_tok = Projector()(encoder_out)
-inputs = torch.cat([embed(prompt_ids), audio_tok, embed(question_ids)], 1)`,
+    def forward(self, h):                     # h: (batch, frames, 1280), 50 per second
+        B, T, D = h.shape
+        T = T // self.k * self.k
+        h = h[:, :T].reshape(B, T // self.k, D * self.k)   # join k neighbours
+        return self.mlp(h)                    # (batch, frames / k, 3584)
+
+audio_tokens = Projector()(encoder_output)
+inputs = torch.cat([embed(prompt_ids), audio_tokens, embed(question_ids)], dim=1)`,
+  rate: (p) => { const d = derive(p); return { value: `${+d.lmHz.toFixed(1)} tok/s`, note: `× ${fmtN(p.lmDim)} numbers` }; },
   mount(ctx) {
-    const { root, audio } = ctx;
-    let k = 2, mode: ProjMode = "stack";
-    const p = el("div", { class: "panel", style: "flex:1" });
-    root.append(p);
-    const sTps = stat("Tokens / s"), s30 = stat("30 s clip"), sHr = stat("1 hour"), sCtx = stat("Hour vs 128k ctx");
-    const kS = slider({ label: "Pool k", min: 1, max: 8, value: k, onInput: (v) => (k = v) });
-    root.append(controls(segmented<ProjMode>("Connector", [["stack", "Stack + MLP"], ["qformer", "Q-Former"], ["codes", "Codec tokens"]], mode, (v) => (mode = v)), kS),
-      el("div", { class: "stat-row" }, sTps, s30, sHr, sCtx));
-    const S = surface(p);
-    const stop = loop((t) => {
-      const { g, w, h } = S;
-      g.clearRect(0, 0, w, h);
-      const enc = encode(audio).stem;
-      const rate = mode === "stack" ? 50 / k : mode === "qformer" ? 3 : 12.5;
-      const showN = Math.min(48, Math.floor((w - 40) / 13));
-      const cw = (w - 40) / showN;
-      // row A: encoder frames
-      const yA = 34;
-      label(g, mode === "codes" ? "CODEC FRAMES · 12.5 Hz · 8 CODEBOOKS EACH" : "ENCODER OUTPUT · 50 Hz · 1280-d", 20, yA - 8, { size: 10.5, color: PALETTE.navy, weight: 700 });
-      const nA = mode === "codes" ? Math.ceil(showN / 4) : showN;
-      const aw = mode === "codes" ? cw * 4 : cw;
-      for (let i = 0; i < nA; i++) {
-        const fr = enc[Math.min(enc.length - 1, i * (mode === "codes" ? 4 : 1))];
-        const rows = mode === "codes" ? 8 : 10;
-        for (let r = 0; r < rows; r++) {
-          g.fillStyle = mode === "codes" ? rampColor(((fr[r * 5] * 9973 + r * 0.37) % 1 + 1) % 1 * 0.8 + 0.1) : rampColor(fr[r * 6] ?? 0.5);
-          g.fillRect(20 + i * aw + 1, yA + r * 7, aw - 2, 6);
-        }
-      }
-      // brackets
-      const yB = yA + 92;
-      const group = mode === "stack" ? k : mode === "qformer" ? 17 : 1;
-      const nB = Math.floor(nA / (mode === "codes" ? 1 : group));
-      label(g, mode === "stack" ? `STACK ${k} → MLP → 4096-d` : mode === "qformer" ? "Q-FORMER · 1 LEARNED QUERY PER 17 FRAMES (0.33 s)" : "EMBED EACH CODE, SUM THE 8 → 4096-d", 20, yB - 14, { size: 10.5, color: PALETTE.navy, weight: 700 });
-      const pulse = (t * 0.6) % 1;
-      for (let i = 0; i < Math.max(1, nB); i++) {
-        const gx = 20 + i * group * aw, gw = group * aw;
-        if (gx + gw > w - 10 && mode !== "qformer") break;
-        g.strokeStyle = PALETTE.line; g.lineWidth = 1.2;
-        g.beginPath(); g.moveTo(gx + 2, yA + 74); g.lineTo(gx + gw / 2, yB - 6); g.lineTo(gx + Math.min(gw, w - 30 - gx) - 2, yA + 74); g.stroke();
-        const ex = gx + gw / 2 - Math.max(3, Math.min(gw - 4, 18)) / 2;
-        const ew = Math.max(4, Math.min(gw - 4, 18));
-        for (let r = 0; r < 14; r++) { g.fillStyle = rampColor(0.3 + 0.5 * Math.abs(Math.sin(i * 1.3 + r * 0.7))); g.fillRect(ex, yB + r * 4.5, ew, 3.8); }
-        if (i === Math.floor(pulse * Math.max(1, nB))) { g.strokeStyle = PALETTE.orange; g.lineWidth = 2; g.strokeRect(ex - 2, yB - 2, ew + 4, 14 * 4.5 + 3); }
-      }
-      // row C: the prompt
-      const yC = yB + 96;
-      label(g, "WHAT THE LANGUAGE MODEL READS", 20, yC - 10, { size: 10.5, color: PALETTE.navy, weight: 700 });
-      const toks: [string, "t" | "a" | "m"][] = [["<|user|>", "m"], ["<audio>", "m"]];
-      const nAudio = Math.min(Math.max(1, nB), 14);
-      for (let i = 0; i < nAudio; i++) toks.push(["", "a"]);
-      if (nB > 14) toks.push(["…", "m"]);
-      toks.push(["</audio>", "m"], ["What", "t"], ["is", "t"], ["this", "t"], ["sound", "t"], ["?", "t"]);
-      let x = 20, y = yC;
-      g.font = '500 11.5px "JetBrains Mono", monospace';
-      for (const [s, kind] of toks) {
-        const tw = kind === "a" ? 16 : g.measureText(s).width + 12;
-        if (x + tw > w - 16) { x = 20; y += 30; }
-        roundRect(g, x, y, tw, 22, 5);
-        g.fillStyle = kind === "a" ? PALETTE.teal : kind === "m" ? "#efe3d1" : "#fdf9f1"; g.fill();
-        g.strokeStyle = kind === "t" ? PALETTE.line : "transparent"; g.lineWidth = 1.2; g.stroke();
-        g.fillStyle = kind === "m" ? PALETTE.muted : PALETTE.navy;
-        g.textAlign = "left"; g.textBaseline = "middle"; if (s) g.fillText(s, x + 6, y + 11.5);
-        x += tw + 5;
-      }
-      label(g, `■ audio tokens  ·  ${Math.round(rate * audio.duration)} for your ${audio.duration.toFixed(1)} s clip`, 20, y + 42, { size: 11.5, color: PALETTE.tealDeep, weight: 600 });
-      sTps.set(rate.toFixed(rate < 10 ? 1 : 0));
-      s30.set(`${Math.round(rate * 30)} tok`);
-      sHr.set(`${Math.round(rate * 3600).toLocaleString()} tok`);
-      sCtx.set(`${Math.round((rate * 3600 * 100) / 128000)} %`);
-      kS.style.opacity = mode === "stack" ? "1" : "0.35";
+    let conn: Conn = "stack";
+    const pS = slider({ label: "Pool k", min: 1, max: 8, value: ctx.pipe().pool, onInput: (v) => ctx.setPipe({ pool: v }) });
+    ctx.row("funnel", "<b>Pooling factor k.</b> How many encoder vectors become one language-model token. This setting carries forward.", pS);
+    const desc = ctx.row("cube", CONN_TEXT[conn]);
+    ctx.row("split", "<b>Other designs.</b> Compare the token rate of the three common ways in.",
+      segmented<Conn>("Design", [["stack", "Stack + MLP"], ["qformer", "Q-Former"], ["codes", "Codec tokens"]], conn, (v) => { conn = v; desc.text(CONN_TEXT[v]); }));
+    const rate = () => (conn === "stack" ? derive(ctx.pipe()).lmHz : conn === "qformer" ? 50 / 17 : 12.5);
+    const sT = ctx.stat("Tokens / second"), s30 = ctx.stat("30 s clip"), sHr = ctx.stat("1 hour"), sCtx = ctx.stat("Hour vs 128k");
+    const tick = ctx.world.onTick(() => {
+      const r = rate();
+      sT.set(r.toFixed(r < 10 ? 1 : 0)); s30.set(fmtN(r * 30)); sHr.set(fmtN(r * 3600)); sCtx.set(`${Math.round((r * 3600 * 100) / 128000)} %`);
     });
-    return () => { stop(); S.dispose(); };
+    ctx.screen("projector", (g, w, h) => {
+      const u = unit(h), r = rate();
+      head(g, w, h, "Context used by audio", `${r.toFixed(r < 10 ? 1 : 0)} tok/s`);
+      const rows: [string, number][] = [["30 s", 30], ["10 min", 600], ["1 hour", 3600]];
+      rows.forEach(([lab, sec], i) => {
+        const y = (22 + i * 24) * u, x0 = 22 * u, ww = w - x0 - 6 * u;
+        const frac = Math.min(1.2, (r * sec) / 128000);
+        g.fillStyle = "#2c3a5e"; g.fillRect(x0, y, ww, 11 * u);
+        g.fillStyle = frac > 1 ? S.red : S.teal; g.fillRect(x0, y, ww * Math.min(1, frac), 11 * u);
+        screenText(g, lab, x0 - 2 * u, y + 8.5 * u, 6 * u, S.ink, "right");
+        screenText(g, `${fmtN(r * sec)}`, x0 + 2 * u, y + 8.5 * u, 6 * u, frac > 0.3 ? S.bg : S.ink, "left", true);
+        if (frac > 1) screenText(g, "doesn't fit", x0 + ww - 2 * u, y + 8.5 * u, 5.5 * u, "#fff", "right");
+      });
+      screenText(g, "bar = share of a 128,000-token context", 6 * u, 94 * u, 4.8 * u, S.dim);
+    });
+    return () => tick();
   },
-  run(ctx: Ctx) {
-    const d = ctx.audio.duration;
-    ctx.log(`clip ${d.toFixed(2)} s → encoder ${Math.round(d * 50)} frames @ 50 Hz × 1280`);
-    for (const k of [1, 2, 4, 8]) ctx.log(`pool k=${k}  →  ${String(Math.round((d * 50) / k)).padStart(4)} audio tokens × 4096  ·  1 h = ${Math.round((3600 * 50) / k).toLocaleString()} tokens`);
-    ctx.log(`Mimi/Moshi  →  ${Math.round(d * 12.5)} steps (8 codes each, summed)`);
-    ctx.log("Fewer tokens is cheaper and longer context; more tokens keeps finer timing.", "ok");
+  run(ctx) {
+    const a = ctx.analysis(), p = ctx.pipe(), dur = a.clip.channels[0].length / a.clip.sr;
+    ctx.log(`encoder output: ${a.enc.T} vectors for ${dur.toFixed(1)} s (${+derive(p).encHz.toFixed(1)} per second) × ${p.encDim}`);
+    for (const k of [1, 2, 4, 8]) ctx.log(`k=${k}: ${String(Math.ceil(a.enc.T / k)).padStart(4)} tokens of ${fmtN(p.lmDim)} · one hour = ${fmtN((3600 * derive(p).encHz) / k)} tokens`, k === p.pool ? "head" : "info");
+    ctx.log("Fewer tokens: cheaper and longer recordings fit. More tokens: finer timing.", "ok");
   },
 };
+

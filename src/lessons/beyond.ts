@@ -1,15 +1,19 @@
-import type { Lesson } from "../types";
-import { el, surface, loop, PALETTE, label, roundRect, button, controls, nextFrame, fmtHz } from "../ui/dom";
+import type { Lesson, Ctx, Callout } from "../types";
+import { segmented, button, el } from "../ui/dom";
 import { SPECIMENS } from "../audio/specimens";
+import { audio, type Clip } from "../audio/engine";
 import { magnitudes, stft } from "../dsp/stft";
 import { melBank } from "../dsp/mel";
-import { mixMono } from "../dsp/signal";
-import { cached, specImage, drawImage, freqAxis, lossyChain } from "./shared";
-import type { Clip } from "../audio/engine";
+import { mixMono, quantize } from "../dsp/signal";
+import { analyse, cached, monoAt } from "../analysis";
+import { ORDER } from "../scene/stations";
+import { PRESETS, getPipe } from "../pipeline";
+import { S, head, unit, screenText, blit, fmtHz, fmtBits, fmtN, specHeat, freqTicks, lossyChain, melOnly, codecDecode, codecError, stages } from "./kit";
+import { STATION_LESSON } from "./start";
 
-// ---------------------------------------------------------------- what a speech front end costs each sound
+// ---------------------------------------------------------------- 15 · what speech pipelines miss
 
-interface Costs { hf: number; side: number; fast: number; semis: number; dom: number; }
+interface Costs { hf: number; side: number; fast: number; semis: number; dom: number; speechErr: number; allErr: number }
 
 function costs(c: Clip): Costs {
   return cached(`costs:${c.id}`, () => {
@@ -25,74 +29,75 @@ function costs(c: Clip): Costs {
     const L = c.channels[0], R = c.channels[1];
     let mid = 0, side = 0;
     for (let i = 0; i < L.length; i++) { mid += (L[i] + R[i]) ** 2; side += (L[i] - R[i]) ** 2; }
-    // loudness envelope (10 ms RMS every 2 ms, which smooths away pitch periods);
-    // how much of its variation is faster than one 80 ms frame?
+    // loudness envelope (10 ms windows every 2 ms); share of its variation faster than one 80 ms frame
     const hop = Math.round(sr * 0.002), win = Math.round(sr * 0.01);
     const env: number[] = [];
     for (let i = 0; i + win <= x.length; i += hop) { let s = 0; for (let j = i; j < i + win; j++) s += x[j] * x[j]; env.push(Math.sqrt(s / win)); }
-    const W = 40;
-    const pre = [0]; for (const v of env) pre.push(pre[pre.length - 1] + v);
-    let vAll = 0, vFast = 0;
+    const W = 40, pre = [0];
+    for (const v of env) pre.push(pre[pre.length - 1] + v);
     const mean = pre[pre.length - 1] / env.length;
-    env.forEach((v, i) => { const a = Math.max(0, i - W / 2), b = Math.min(env.length, i + W / 2); const sm = (pre[b] - pre[a]) / (b - a); vAll += (v - mean) ** 2; vFast += (v - sm) ** 2; });
-    const bank = melBank(16000, 512, 80, 0, 8000);
+    let vAll = 0, vFast = 0;
+    env.forEach((v, i) => { const a = Math.max(0, i - W / 2), b = Math.min(env.length, i + W / 2); vAll += (v - mean) ** 2; vFast += (v - (pre[b] - pre[a]) / (b - a)) ** 2; });
+    const bank = melBank(16000, 400, 80, 0, 8000);
     let semis = NaN;
     if (domHz < 8000) {
-      let m = 0; for (let j = 0; j < 80; j++) if (Math.abs(bank.edges[j + 1] - domHz) < Math.abs(bank.edges[m + 1] - domHz)) m = j;
-      // half-maximum width of the triangle around its centre
+      let m = 0;
+      for (let j = 0; j < 80; j++) if (Math.abs(bank.edges[j + 1] - domHz) < Math.abs(bank.edges[m + 1] - domHz)) m = j;
       semis = 12 * Math.log2((bank.edges[m + 1] + bank.edges[m + 2]) / (bank.edges[m] + bank.edges[m + 1]));
     }
-    return { hf: hiE / (tot || 1), side: side / (mid + side || 1), fast: vFast / (vAll || 1), semis, dom: domHz };
+    const a = analyse(c, getPipe());
+    return { hf: hiE / (tot || 1), side: side / (mid + side || 1), fast: vFast / (vAll || 1), semis, dom: domHz, speechErr: codecError(a, "speech")[7], allErr: codecError(a, "all")[7] };
   });
 }
 
-const AXES: { key: keyof Costs; name: string; fmt: (c: Costs) => string; frac: (c: Costs) => number; why: string }[] = [
-  { key: "hf", name: "Above 8 kHz", fmt: (c) => `${(c.hf * 100).toFixed(0)}%`, frac: (c) => c.hf, why: "energy a 16 kHz model never receives" },
-  { key: "side", name: "Stereo", fmt: (c) => `${(c.side * 100).toFixed(0)}%`, frac: (c) => Math.min(1, c.side * 2), why: "energy only in the L−R difference, gone in mono" },
-  { key: "fast", name: "Faster than 80 ms", fmt: (c) => `${(c.fast * 100).toFixed(0)}%`, frac: (c) => c.fast, why: "loudness changes that fall inside one Mimi frame" },
-  { key: "semis", name: "Mel band width", fmt: (c) => (isNaN(c.semis) ? "cut" : `${c.semis.toFixed(1)} st`), frac: (c) => (isNaN(c.semis) ? 1 : Math.min(1, c.semis / 12)), why: "semitones per band at the strongest pitch" },
-];
+const pct = (v: number) => `${Math.round(v * 100)}%`;
 
-export const richer: Lesson = {
-  id: "richer",
-  title: "Sound is more than speech",
+export const beyond: Lesson = {
+  id: "beyond",
+  short: "Beyond speech",
+  title: "What speech pipelines miss",
   chapter: "Beyond speech",
-  blurb: "A speech pipeline is tuned to keep words. Run birdsong, drums, rain and a piano through it and measure what each one loses.",
-  rail: [1, 2, 3, 4, 5, 6],
-  rate: { value: "1.41 Mb/s", note: "CD audio, for comparison" },
-  tabs: {
-    overview: `
-      <p class="lead">Every choice so far was tuned for speech: 16 kHz, mono, 25 ms frames, mel bands, a speech-trained codebook, transcripts as the target. Speech survives that. A lot of other sound doesn't.</p>
-      <p>Each row measures, <b>on that actual sound</b>, four costs of a speech front end:</p>
-      <ul>
-        <li><b>Above 8 kHz</b>: energy cut by resampling to 16 kHz.</li>
-        <li><b>Stereo</b>: energy that only exists as a left/right difference.</li>
-        <li><b>Faster than 80 ms</b>: loudness changes inside a single 12.5 Hz frame.</li>
-        <li><b>Mel band width</b>: how many semitones one mel band spans at the sound's main pitch. Above 1 means neighbouring notes merge.</li>
-      </ul>
-      <p>Click a row, then compare the original with what a speech front end keeps. The Vowels barely change. The others don't come through as well.</p>`,
-    hood: `
-      <p>What hearing uses that speech models mostly don't:</p>
-      <ul>
-        <li><b>Space</b>: interaural time and level differences locate a sound to within a few degrees. Mono can't represent any of it.</li>
-        <li><b>Timing</b>: people hear gaps of a few milliseconds; musicians care about 10 ms timing errors. One token per 80 ms can't line up a flam.</li>
-        <li><b>Pitch</b>: music needs semitone (6 %) resolution or better across the whole range, where mel resolution gets coarse.</li>
-        <li><b>Mixtures</b>: real scenes are many sources at once (a voice over music over traffic), and one codebook entry per frame has to describe all of them.</li>
-        <li><b>Paralinguistics</b>: laughter, sighs, breath, hesitation, emotion. Tokenizers distilled from ASR-style features tend to drop these.</li>
-      </ul>`,
-    lost: `
-      <p class="lead">This is the lesson about what's lost.</p>
-      <p>Most of the losses were reasonable on their own. Together, they describe a system that hears <b>words</b>, not <b>sound</b>.</p>
-      <p>General audio models do exist, such as BEATs and AudioMAE encoders, CLAP embeddings, DAC and EnCodec codecs at 32–44.1 kHz, and LLMs with general-audio encoders. But the speaking, real-time systems (the ones you talk to) are still built mostly on speech tokens.</p>
-      <p>That's the open problem. The next lesson maps where things stand.</p>`,
-    specs: [
-      ["Hearing", "20 Hz – 20 kHz · 2 ears"],
-      ["Temporal acuity", "gaps of ≈ 2–5 ms"],
-      ["Pitch acuity", "≈ 0.2–1 % (< ⅙ semitone)"],
-      ["Localisation", "≈ 1–2° in front"],
-      ["Speech front end", "8 kHz · mono · 10–80 ms · mel"],
-    ],
-  },
+  thumb: ["source", "mic", "adc"],
+  focus: ["source", "mic", "adc", "fft", "mel"],
+  view: { fill: 0.86, offset: [0, 0.03] },
+  callouts: [
+    { at: "mic.grille", icon: "stereo", title: "Space", text: "Where sounds are. Lost when two channels become one.", slot: "tl" },
+    { at: "adc.clock", icon: "rings", title: "Brightness", text: "Everything above 8 kHz. Lost at 16 kHz.", slot: "bl" },
+    { at: "fft.bars", icon: "clock", title: "Timing", text: "Attacks and rhythms faster than one frame.", slot: "br" },
+    { at: "mel.screen", icon: "screen", title: "Before and after", text: "The selected sound as recorded, and after a speech front end.", slot: "tr" },
+  ],
+  summary: "Every choice so far was tuned for speech: 16 kHz, one channel, 25 ms frames, mel bands, codebooks trained on talking. Speech survives all of it. This lesson measures, sound by sound, what the same pipeline costs everything else.",
+  steps: [
+    "<b>Above 8 kHz:</b> the share of the sound's energy above 8 kHz, removed when resampling to 16 kHz.",
+    "<b>Stereo:</b> the share of energy that only exists as a difference between left and right. Averaging to mono cancels it.",
+    "<b>Faster than 80 ms:</b> how much of the loudness pattern changes faster than one Mimi frame. Measured on a 10 ms loudness curve.",
+    "<b>Band width:</b> how many semitones one of Whisper's 80 mel bands spans at the sound's strongest pitch. Over 1 means neighbouring piano notes land in the same band.",
+    "<b>Speech codebooks:</b> the average error, in decibels per band, after encoding the sound with 8 codebooks trained only on speech, against 8 trained on all seven sounds.",
+    "Click a row to select and play that sound, then compare the original with <b>Speech front end</b>.",
+  ],
+  lost: `<p>Taken together, the losses describe a system built to hear <b>words</b>:</p>
+  <ul>
+    <li><b>Space</b>: direction and distance, which need two or more channels and fine timing.</li>
+    <li><b>Timing</b>: people notice gaps of a few milliseconds and musicians notice 10 ms timing errors; one token per 80 ms can't represent them.</li>
+    <li><b>Pitch</b>: music needs semitone resolution or better across the whole range, where mel bands get coarse.</li>
+    <li><b>Mixtures</b>: real scenes are several sources at once, while a codebook entry describes one blended frame.</li>
+    <li><b>Non-verbal sound</b>: laughter, sighs, breath, hesitation and emotion, which speech-trained features tend to drop.</li>
+  </ul>
+  <p>General-audio models exist (next lesson), but most systems you can talk to are still built on speech tokens.</p>`,
+  words: [
+    ["Spatial audio", "Sound that carries direction and distance, recorded with two or more channels."],
+    ["Transient", "A very short, sharp event: a drum hit, a click, a consonant."],
+    ["Polyphony", "Several notes or sources at the same time."],
+    ["Paralinguistics", "Everything about speech that isn't the words: tone, emotion, laughter, pauses."],
+    ["Sound event", "A non-speech sound with a name: a door slam, a siren, a bird call."],
+  ],
+  specs: [
+    ["Human hearing", "20 Hz – 20 kHz, 2 ears"],
+    ["Gap detection", "≈ 2–5 ms"],
+    ["Pitch discrimination", "≈ 0.2–1 % (under ⅙ semitone)"],
+    ["Direction (straight ahead)", "≈ 1–2°"],
+    ["Speech front end", "8 kHz band · mono · 10–80 ms · 80 bands"],
+  ],
   code: `import numpy as np, librosa
 
 def speech_front_end_costs(stereo, sr):
@@ -100,232 +105,296 @@ def speech_front_end_costs(stereo, sr):
     S = np.abs(librosa.stft(mono, n_fft=2048)) ** 2
     f = librosa.fft_frequencies(sr=sr, n_fft=2048)
     above_8k = S[f >= 8000].sum() / S.sum()
-    side = ((stereo[0] - stereo[1]) ** 2).sum()
-    stereo_share = side / (side + ((stereo[0] + stereo[1]) ** 2).sum())
-    env = librosa.feature.rms(y=mono, hop_length=sr // 1000)[0]
-    smooth = np.convolve(env, np.ones(80) / 80, "same")   # 80 ms
+
+    l, r = stereo
+    side = np.sum((l - r) ** 2) / (np.sum((l + r) ** 2) + np.sum((l - r) ** 2))
+
+    env = librosa.feature.rms(y=mono, frame_length=sr // 100, hop_length=sr // 500)[0]
+    smooth = np.convolve(env, np.ones(40) / 40, mode="same")   # 80 ms
     fast = np.var(env - smooth) / np.var(env)
-    return above_8k, stereo_share, fast`,
+    return above_8k, side, fast`,
+  rate: () => ({ value: "1.41 Mb/s", note: "CD audio, for comparison" }),
   mount(ctx) {
-    const { root, audio } = ctx;
-    const grid = el("div", { class: "cost-table", role: "table" });
-    grid.append(el("div", { class: "cost-row cost-head", role: "row" }, el("span", {}, "Sound"), ...AXES.map((ax) => el("span", { title: ax.why }, ax.name))));
-    const row = el("div", { class: "viz-row", style: "flex:1" });
-    const pa = el("div", { class: "panel" }, el("span", { class: "panel-title" }, "Original"));
-    const pb = el("div", { class: "panel" }, el("span", { class: "panel-title" }, "After a speech front end"));
-    row.append(pa, pb);
-    root.append(grid, row);
-    const status = el("span", { class: "legend" });
-    root.append(controls(button("▶ Original", () => audio.playClip(), "btn"), button("▶ Speech front end", () => { if (result) audio.playSignal(result.channels, result.sr); }, "btn primary"), status));
-    const A = surface(pa), B = surface(pb);
-    let imA: HTMLCanvasElement | null = null, imB: HTMLCanvasElement | null = null, result: { channels: Float32Array[]; sr: number } | null = null;
-    const cards = new Map<string, HTMLElement>();
-    for (const s of SPECIMENS) {
-      const c = costs(audio.specimen(s.id));
-      const r = el("button", { type: "button", class: "cost-row", role: "row", title: `Play ${s.name}` }, el("b", {}, s.name));
-      for (const ax of AXES) {
-        const f = Math.max(0.02, ax.frac(c));
-        r.append(el("span", { class: "cost-cell", title: ax.why },
-          el("i", { style: `background:linear-gradient(90deg,${f > 0.3 ? "var(--red)" : "var(--teal)"} ${f * 100}%,var(--track) ${f * 100}%)` }),
-          el("em", {}, ax.fmt(c))));
+    let before: HTMLCanvasElement | null = null, after: HTMLCanvasElement | null = null, result: { channels: Float32Array[]; sr: number } | null = null, token = 0;
+    const table = el("table", { class: "table" });
+    const render = () => {
+      table.innerHTML = `<tr><th>Sound</th><th>&gt;8 kHz</th><th>Stereo</th><th>&lt;80 ms</th><th>Band</th><th>Speech codebooks</th></tr>`;
+      for (const s of SPECIMENS) {
+        const c = costs(audio.specimen(s.id));
+        const tr = el("tr", { "data-click": "1", class: audio.clip.id === s.id ? "is-on" : "" });
+        tr.innerHTML = `<td>${s.name}</td><td class="${c.hf > 0.2 ? "bad" : ""}">${pct(c.hf)}</td><td class="${c.side > 0.2 ? "bad" : ""}">${pct(c.side)}</td><td class="${c.fast > 0.3 ? "bad" : ""}">${pct(c.fast)}</td><td class="${isNaN(c.semis) || c.semis > 2 ? "bad" : ""}">${isNaN(c.semis) ? "above" : c.semis.toFixed(1) + " st"}</td><td class="${c.speechErr > 6 ? "bad" : ""}">${c.speechErr.toFixed(0)} dB <span style="color:var(--faint)">vs ${c.allErr.toFixed(0)}</span></td>`;
+        tr.addEventListener("click", () => { audio.useSpecimen(s.id); audio.playClip(); });
+        table.append(tr);
       }
-      r.addEventListener("click", () => { audio.useSpecimen(s.id); audio.playClip(); });
-      cards.set(s.id, r);
-      grid.append(r);
-    }
-    let token = 0;
-    async function select() {
-      cards.forEach((c, id) => c.classList.toggle("is-on", id === audio.clip.id));
-      imA = specImage(audio.clip.channels[0], audio.clip.sr, 24000, 200);
-      imB = null; result = null;
+    };
+    render();
+    ctx.row("grid", "<b>Cost of a speech front end, per sound.</b> Red marks a large loss. Click a row to hear it. The last column is the codec's error with codebooks trained on speech, versus on all sounds.", table);
+    const status = ctx.row("ear", "Compare the selected sound with what a speech front end keeps (mono, 16 kHz, no phase, 80 bands).",
+      el("div", { class: "btns" }, button("▶ Speech front end", () => { if (result) audio.playSignal(result.channels, result.sr); }, "btn primary"), button("▶ Original", () => audio.playClip(), "btn")));
+    const sel = async () => {
       const my = ++token;
-      status.textContent = "running the speech front end…";
-      await nextFrame();
+      before = specHeat(audio.clip.channels[0], audio.clip.sr, 24000, 180);
+      after = null; result = null;
+      render();
+      status.text("Running the speech front end…");
+      await new Promise((r) => setTimeout(r, 30));
       if (my !== token) return;
-      const r = lossyChain(audio.clip, { mono: true, sr16: true, phase: true, mel: true, pool: false });
-      if (my !== token) return;
-      result = r;
-      imB = specImage(r.channels[0], r.sr, 24000, 200);
+      result = lossyChain(audio.clip, { mono: true, sr16: true, phase: true, mel: true, pool: false });
+      after = specHeat(result.channels[0], result.sr, 24000, 180);
       const c = costs(audio.clip);
-      status.textContent = `strongest pitch ${fmtHz(c.dom)} · ${(c.hf * 100).toFixed(0)}% of energy above 8 kHz`;
-    }
-    void select();
-    const off = audio.on(() => { if (!cards.get(audio.clip.id)?.classList.contains("is-on")) void select(); });
-    const stop = loop(() => {
-      for (const [S, im] of [[A, imA], [B, imB]] as const) {
-        const { g, w, h } = S;
-        g.clearRect(0, 0, w, h);
-        const x0 = 38, y0 = 34, ww = w - 46, hh = h - 42;
-        if (im) drawImage(g, im, x0, y0, ww, hh);
-        else label(g, "computing…", x0 + ww / 2, y0 + hh / 2, { align: "center", size: 12, color: PALETTE.faint });
-        freqAxis(g, x0, y0, hh, 24000);
-        const p = audio.position();
-        if (p >= 0 && audio.playing) { g.fillStyle = PALETTE.orange; g.fillRect(x0 + (p / audio.duration) * ww - 1, y0, 2, hh); }
+      status.text(`<b>${audio.clip.name}:</b> strongest pitch ${fmtHz(c.dom)}, ${pct(c.hf)} of its energy above 8 kHz. Compare:`);
+    };
+    void sel();
+    ctx.onChange(() => void sel());
+    ctx.screen("mel", (g, w, h) => {
+      const u = unit(h);
+      head(g, w, h, audio.clip.name, "recorded / kept");
+      const x0 = 12 * u, ww = w - 15 * u, hh = 37 * u;
+      for (const [im, y] of [[before, 14 * u], [after, 57 * u]] as const) {
+        if (im) blit(g, im, x0, y, ww, hh); else screenText(g, "working…", x0 + ww / 2, y + hh / 2, 6 * u, S.dim, "center");
+        freqTicks(g, x0, y, hh, 24000, u);
       }
     });
-    return () => { stop(); off(); A.dispose(); B.dispose(); };
+    return undefined;
   },
   run(ctx) {
-    ctx.log("sound         >8kHz  stereo  <80ms  mel-band");
+    ctx.log("sound          >8 kHz  stereo  <80 ms  band     speech-codebook error");
     for (const s of SPECIMENS) {
-      const c = costs(ctx.audio.specimen(s.id));
-      ctx.log(`${s.name.padEnd(12)}  ${AXES.map((a) => a.fmt(c).padStart(6)).join("  ")}`, c.hf > 0.3 || c.side > 0.2 || c.fast > 0.3 ? "warn" : "info");
+      const c = costs(audio.specimen(s.id));
+      ctx.log(`${s.name.padEnd(13)} ${pct(c.hf).padStart(6)} ${pct(c.side).padStart(7)} ${pct(c.fast).padStart(7)}  ${(isNaN(c.semis) ? "above" : c.semis.toFixed(1) + " st").padEnd(8)} ${c.speechErr.toFixed(1)} dB (all-sound codebooks: ${c.allErr.toFixed(1)} dB)`, c.hf > 0.2 || c.side > 0.2 || c.speechErr > 6 ? "warn" : "info");
     }
-    const c = costs(ctx.audio.clip);
-    if (ctx.audio.clip.source !== "specimen") ctx.log(`${ctx.audio.clip.name.padEnd(12)}  ${AXES.map((a) => a.fmt(c).padStart(6)).join("  ")}`, "head");
-    ctx.log("Red rows: sounds a speech-first pipeline represents badly.", "ok");
+    ctx.log("Warnings mark sounds a speech-first pipeline describes poorly.", "ok");
   },
 };
 
-// ---------------------------------------------------------------- 16 · landscape
+// ---------------------------------------------------------------- 16 · where the field is
 
-interface Codec { name: string; org: string; year: number; hz: number; kbps: number; sr: string; kind: "speech" | "general" | "classic" | "semantic"; note: string; }
-const CODECS: Codec[] = [
-  { name: "MP3", org: "Fraunhofer / MPEG", year: 1993, hz: 38.3, kbps: 128, sr: "44.1 kHz", kind: "classic", note: "Hand-designed psychoacoustic codec: 1152-sample frames, drops what masking hides. Not tokens, but a useful reference for 'transparent' music." },
-  { name: "Opus", org: "IETF", year: 2012, hz: 50, kbps: 6, sr: "8–48 kHz", kind: "classic", note: "The codec in your video calls: 20 ms frames, 6–510 kb/s. At 6 kb/s it's narrowband speech; good music needs ~64 kb/s+." },
-  { name: "SoundStream", org: "Google", year: 2021, hz: 75, kbps: 6, sr: "24 kHz", kind: "general", note: "First widely used neural RVQ codec: conv encoder (stride 320), RVQ, adversarial training. 3–18 kb/s with quantizer dropout. Basis of AudioLM's acoustic tokens." },
-  { name: "EnCodec", org: "Meta", year: 2022, hz: 75, kbps: 6, sr: "24 / 48 kHz", kind: "general", note: "Open RVQ codec: up to 32 codebooks × 1024, 1.5–24 kb/s. Used by MusicGen and many TTS systems. A 48 kHz stereo music variant exists." },
-  { name: "DAC", org: "Descript", year: 2023, hz: 86, kbps: 7.7, sr: "44.1 kHz", kind: "general", note: "Improved RVQ codec (factorised, L2-normalised codes, snake activations): 9 × 1024 at 86 Hz, full-band 44.1 kHz for speech, music and sound." },
-  { name: "SpeechTokenizer", org: "Fudan", year: 2023, hz: 50, kbps: 4, sr: "16 kHz", kind: "speech", note: "RVQ codec whose first codebook is distilled from HuBERT, the same idea Mimi uses: semantic first, acoustic after. 8 × 1024 at 50 Hz." },
-  { name: "Mimi", org: "Kyutai", year: 2024, hz: 12.5, kbps: 1.1, sr: "24 kHz", kind: "speech", note: "12.5 Hz, 8 × 2048, split RVQ with WavLM distillation, causal and streaming. Tokenizer for Moshi; also used by Sesame's CSM." },
-  { name: "WavTokenizer", org: "Zhejiang U. et al.", year: 2024, hz: 40, kbps: 0.48, sr: "24 kHz", kind: "general", note: "A single codebook of 4096 at 40 or 75 tokens/s: one token per step, which makes LM modelling simple. Trained on speech, music and audio." },
-  { name: "SNAC", org: "Hubert Siuzdak", year: 2024, hz: 47, kbps: 0.98, sr: "24 / 32 / 44 kHz", kind: "speech", note: "Multi-scale RVQ: coarse codebooks tick slower (≈12 Hz) and fine ones faster (≈47 Hz). Speech model at 0.98 kb/s; music variants too." },
-  { name: "HuBERT units", org: "Meta", year: 2021, hz: 50, kbps: 0.45, sr: "16 kHz", kind: "semantic", note: "k-means (K≈500) on HuBERT features. Pure content: you need a separate vocoder and speaker info to get a voice back. Used in GSLM, SpeechGPT, many S2ST systems." },
+interface Item { name: string; who: string; year: number; kind: "speech" | "general" | "classic" | "semantic" | "model"; hz?: number; kbps?: number; sr?: string; note: string }
+
+const ITEMS: Item[] = [
+  { name: "MP3", who: "Fraunhofer / MPEG", year: 1993, kind: "classic", hz: 38.3, kbps: 128, sr: "44.1 kHz", note: "A hand-designed codec: 1,152-sample frames, dropping what masking hides from human ears. Not tokens, but a reference point for transparent music." },
+  { name: "Opus", who: "IETF", year: 2012, kind: "classic", hz: 50, kbps: 6, sr: "8–48 kHz", note: "The codec in most video calls: 20 ms frames, 6 to 510 kb/s. At 6 kb/s it carries narrow-band speech; good music needs 64 kb/s or more." },
+  { name: "HuBERT units", who: "Meta", year: 2021, kind: "semantic", hz: 50, kbps: 0.45, sr: "16 kHz", note: "k-means (about 500 entries) on HuBERT features. Pure content: turning them back into a voice needs a separate vocoder. Used in early spoken language models." },
+  { name: "SoundStream", who: "Google", year: 2021, kind: "general", hz: 75, kbps: 6, sr: "24 kHz", note: "The first widely used neural RVQ codec, 3 to 18 kb/s. Its tokens are the acoustic layer of AudioLM." },
+  { name: "EnCodec", who: "Meta", year: 2022, kind: "general", hz: 75, kbps: 6, sr: "24 / 48 kHz", note: "Open RVQ codec with up to 32 codebooks of 1,024 (1.5 to 24 kb/s). Used by MusicGen and many speech synthesisers; a 48 kHz stereo music version exists." },
+  { name: "DAC", who: "Descript", year: 2023, kind: "general", hz: 86, kbps: 7.7, sr: "44.1 kHz", note: "Improved RVQ codec: 9 codebooks of 1,024 at 86 frames per second, full-band audio for speech, music and sound effects." },
+  { name: "SpeechTokenizer", who: "Fudan University", year: 2023, kind: "speech", hz: 50, kbps: 4, sr: "16 kHz", note: "RVQ codec whose first codebook is distilled from HuBERT: the semantic-first idea Mimi also uses. 8 codebooks of 1,024 at 50 per second." },
+  { name: "Mimi", who: "Kyutai", year: 2024, kind: "speech", hz: 12.5, kbps: 1.1, sr: "24 kHz", note: "12.5 frames per second, 8 codebooks of 2,048, split RVQ with WavLM distillation, fully causal. The tokenizer of Moshi, also used by Sesame's CSM." },
+  { name: "WavTokenizer", who: "Zhejiang University et al.", year: 2024, kind: "general", hz: 40, kbps: 0.48, sr: "24 kHz", note: "A single codebook of 4,096 at 40 or 75 tokens per second, so one token per step: simple for a language model to predict." },
+  { name: "SNAC", who: "Hubert Siuzdak", year: 2024, kind: "speech", hz: 47, kbps: 0.98, sr: "24 kHz", note: "Multi-scale RVQ: coarse codebooks tick slowly (about 12 per second), fine ones faster (about 47). 0.98 kb/s for speech; music versions too." },
 ];
 
-const MODELS: [string, string, string][] = [
-  ["Whisper", "OpenAI · 2022", "Log-mel encoder-decoder trained on 680k h of web transcripts. Default ASR front end; its encoder feeds many audio-LMs."],
-  ["wav2vec 2.0 · HuBERT · WavLM", "Meta / Microsoft · 2020–21", "Self-supervised speech encoders on raw 16 kHz audio, 50 Hz. WavLM is Mimi's semantic teacher."],
-  ["BEATs · AudioMAE", "Microsoft / Meta · 2022", "General audio encoders trained on AudioSet spectrogram patches. Hear dogs, engines, music genres, not just words."],
-  ["CLAP", "LAION / Microsoft · 2022–23", "Contrastive audio–text embeddings (like CLIP). Zero-shot sound classification and retrieval."],
-  ["AudioLM", "Google · 2022", "Hierarchical token LM: semantic tokens (w2v-BERT) then acoustic tokens (SoundStream). Continues speech or piano in the same voice/style."],
-  ["SALMONN", "Tsinghua / ByteDance · 2023", "Whisper + BEATs encoders → window-level Q-Former → Vicuna. Speech, sound and music understanding in one LM."],
-  ["Qwen2-Audio · Qwen2.5-Omni", "Alibaba · 2024–25", "Whisper-large-v3 encoder (pooled to 25 Hz) into Qwen. Omni adds a 'Thinker–Talker' split to stream speech out."],
-  ["Moshi", "Kyutai · 2024", "Full-duplex speech LM: Mimi tokens for both speakers + inner-monologue text on a 7B Helium backbone. Open weights."],
-  ["GPT-4o · Gemini", "OpenAI / Google · 2024–", "Native audio in and out in production assistants. Architectures and tokenizers aren't public."],
-  ["CSM", "Sesame · 2025", "Conversational speech generation: a Llama-style backbone predicting Mimi codes, with a small decoder for the later codebooks."],
+const MODELS: Item[] = [
+  { name: "Whisper", who: "OpenAI", year: 2022, kind: "model", note: "Log-mel encoder plus text decoder, trained on 680,000 hours of transcribed web audio (large-v3: about 5 million hours, mostly machine-labelled). Its encoder feeds many audio language models." },
+  { name: "wav2vec 2.0 · HuBERT · WavLM", who: "Meta, Microsoft", year: 2020, kind: "model", note: "Self-supervised speech encoders that learn from unlabelled 16 kHz audio by predicting masked parts. 50 vectors per second. WavLM is Mimi's teacher." },
+  { name: "BEATs · AudioMAE", who: "Microsoft, Meta", year: 2022, kind: "model", note: "General-audio encoders trained on AudioSet by treating the spectrogram as an image cut into patches. They respond to dogs, engines and music as well as words." },
+  { name: "CLAP", who: "LAION, Microsoft", year: 2022, kind: "model", note: "Matches audio and text in one vector space (like CLIP for images). Used for zero-shot sound classification and search." },
+  { name: "AudioLM", who: "Google", year: 2022, kind: "model", note: "Language model over two token layers, semantic (w2v-BERT) then acoustic (SoundStream). Continues speech or piano in the same voice or style." },
+  { name: "SALMONN", who: "Tsinghua, ByteDance", year: 2023, kind: "model", note: "Whisper and BEATs encoders → window Q-Former → Vicuna. One of the first models to handle speech, sounds and music together." },
+  { name: "Qwen2-Audio · Qwen2.5-Omni", who: "Alibaba", year: 2024, kind: "model", note: "Whisper-large-v3 encoder pooled to 25 tokens per second into a Qwen language model. Omni adds a separate \"talker\" that streams speech out." },
+  { name: "Moshi", who: "Kyutai", year: 2024, kind: "model", note: "Full-duplex speech model: Mimi tokens for both sides plus time-aligned text on a 7B backbone. Open weights." },
+  { name: "GPT-4o · Gemini", who: "OpenAI, Google", year: 2024, kind: "model", note: "Production assistants with audio in and out. Their architectures and tokenizers are not published." },
+  { name: "CSM", who: "Sesame", year: 2025, kind: "model", note: "Conversational speech generation: a Llama-style backbone predicts Mimi's first codebook and a small decoder fills in the rest." },
 ];
 
-const KIND_COL: Record<Codec["kind"], string> = { speech: PALETTE.teal, general: PALETTE.orange, classic: PALETTE.faint, semantic: PALETTE.navy };
+const COL: Record<Item["kind"], string> = { speech: S.teal, general: S.orange, classic: "#8f99b3", semantic: "#f3ead8", model: S.teal };
 
-export const landscape: Lesson = {
-  id: "landscape",
-  title: "The landscape",
+export const field: Lesson = {
+  id: "field",
+  short: "The field today",
+  title: "Where the field is",
   chapter: "Beyond speech",
-  blurb: "Where today's audio representations sit, from hand-built codecs to neural tokenizers and the models that read them. Click anything for details.",
-  rail: [5, 6, 7, 8, 9],
-  rate: { value: "0.45 – 128 kb/s", note: "from HuBERT units to MP3" },
-  tabs: {
-    overview: `
-      <p class="lead">The map plots codecs and tokenizers by <b>tokens per second</b> (frames) against <b>bits per second</b>. Down and left is cheaper for a language model; up and right keeps more sound.</p>
-      <p>Colour shows what each was built for: <b style="color:#157f7d">speech</b>, <b style="color:#c0652d">general audio</b>, <b style="color:#18213d">semantic units</b>, and <b style="color:#8d8a85">classical codecs</b> for reference.</p>
-      <p>The cards below are the models that <i>use</i> these representations: encoders, audio-LMs and speech-to-speech systems.</p>
-      <p>The trend since 2021 is toward fewer tokens per second and more meaning per token. The open question is whether that can work for <b>all</b> sound, not just speech.</p>`,
-    hood: `
-      <h3>Open problems</h3>
-      <ul>
-        <li><b>One tokenizer for everything:</b> speech, music and environmental sound at low frame rates without the music turning to mush.</li>
-        <li><b>Space:</b> almost every model above is mono. Multichannel and binaural audio LMs are early research.</li>
-        <li><b>Mixtures:</b> representing several overlapping sources, rather than one blended frame.</li>
-        <li><b>Time:</b> hours-long audio in context, and millisecond-accurate timing inside it.</li>
-        <li><b>Paralinguistics:</b> keeping and using emotion, emphasis, laughter and hesitation, on input and on output.</li>
-        <li><b>Evaluation:</b> benchmarks like MMAU and AIR-Bench show sound and music reasoning far behind transcription.</li>
-      </ul>`,
-    lost: `
-      <p>The whole course in one list:</p>
-      <ul>
-        <li class="lostline"><b>Mic:</b> direction, extremes, quiet</li>
-        <li class="lostline"><b>ADC:</b> above Nyquist, below the noise floor</li>
-        <li class="lostline"><b>Front end:</b> stereo, above 8 kHz, phase, fine pitch</li>
-        <li class="lostline"><b>Encoder:</b> whatever the objective didn't need</li>
-        <li class="lostline"><b>Tokens:</b> everything between codewords</li>
-        <li class="lostline"><b>Projector:</b> timing detail, context budget</li>
-        <li class="lostline"><b>LM + head:</b> anything the answer doesn't ask for</li>
-      </ul>
-      <p>None of these steps is wrong. They show what the system was designed to care about.</p>`,
-    specs: [
-      ["Lowest frame rate", "Mimi · 12.5 Hz"],
-      ["Single-codebook", "WavTokenizer · 40–75 Hz"],
-      ["Full-band neural", "DAC · 44.1 kHz"],
-      ["Semantic-first RVQ", "SpeechTokenizer, Mimi"],
-      ["Full-duplex open", "Moshi (2024)"],
-    ],
-  },
-  code: `# The same clip through three different "ears"
-import whisper, torch
+  thumb: ["tokens", "lm"],
+  focus: ["lm", "head", "voice"],
+  view: { fill: 0.8 },
+  callouts: [],
+  summary: "Codecs and tokenizers decide what a model can hear and say. The map plots them by <b>frames per second</b> (how many steps a model must take per second of audio) and <b>bits per second</b> (how much detail survives). Click any name for details, then read the open problems under <i>How it works</i>.",
+  steps: [
+    "<b>One tokenizer for everything.</b> Keep speech, music and environmental sound at a low frame rate without music turning to mush.",
+    "<b>Space.</b> Almost every model on the map is mono. Multichannel and binaural audio models are early research.",
+    "<b>Mixtures.</b> Represent several overlapping sources, rather than one blended frame.",
+    "<b>Time.</b> Fit hours of audio in context while keeping millisecond timing.",
+    "<b>Beyond words.</b> Keep and use emotion, emphasis, laughter and hesitation, both when listening and when speaking.",
+    "<b>Evaluation.</b> Benchmarks such as MMAU and AIR-Bench show reasoning about sound and music well behind transcription.",
+  ],
+  lost: `<p>The whole course in one list:</p><ul>
+    <li><b>Microphone:</b> direction, extremes, very quiet sounds</li>
+    <li><b>ADC:</b> everything above half the sample rate, detail below the bit depth</li>
+    <li><b>Front end:</b> stereo, above 8 kHz, phase, fine pitch</li>
+    <li><b>Encoder:</b> whatever its training didn't reward</li>
+    <li><b>Tokens:</b> everything between codebook entries</li>
+    <li><b>Projector:</b> timing finer than one token, context</li>
+    <li><b>Language model and head:</b> whatever the answer doesn't need</li>
+  </ul><p>None of these steps is a mistake. Each one reflects what the system was built to care about.</p>`,
+  words: [
+    ["Tokenizer", "Whatever turns audio into the tokens a model reads: a codec, or k-means on encoder features."],
+    ["Semantic tokens", "Tokens that capture what was said (from a self-supervised encoder)."],
+    ["Acoustic tokens", "Tokens that capture how it sounded (from a codec trained to rebuild audio)."],
+    ["Audio language model", "A language model that reads, and sometimes writes, audio tokens."],
+  ],
+  specs: [
+    ["Lowest frame rate here", "Mimi, 12.5 / s"],
+    ["One token per step", "WavTokenizer"],
+    ["Full-band neural codec", "DAC, 44.1 kHz"],
+    ["Semantic-first codebooks", "SpeechTokenizer, Mimi"],
+    ["Open full-duplex model", "Moshi (2024)"],
+  ],
+  code: `# The same sound through three different "ears"
+import whisper
 from transformers import MimiModel, ClapModel, ClapProcessor
 
-text  = whisper.load_model("turbo").transcribe("clip.wav")["text"]
+text = whisper.load_model("turbo").transcribe("clip.wav")["text"]
 
-mimi  = MimiModel.from_pretrained("kyutai/mimi")
-codes = mimi.encode(wav_24k[None, None]).audio_codes      # (1, 8, T)
+mimi = MimiModel.from_pretrained("kyutai/mimi")
+codes = mimi.encode(wav_24k[None, None]).audio_codes          # (1, 8, frames)
 
-clap  = ClapModel.from_pretrained("laion/clap-htsat-unfused")
-proc  = ClapProcessor.from_pretrained("laion/clap-htsat-unfused")
-emb   = clap.get_audio_features(**proc(audios=wav_48k, sampling_rate=48000,
-                                       return_tensors="pt"))
-print(text, codes.shape, emb.shape)   # words, tokens, one 512-d vector`,
-  mount(ctx) {
-    const { root } = ctx;
-    let sel: string | null = "Mimi";
-    const row = el("div", { class: "viz-row", style: "flex:1.3" });
-    const p = el("div", { class: "panel", style: "flex:1.6" }, el("span", { class: "panel-title" }, "Codecs & tokenizers · frames/s vs bits/s (log–log)"));
-    const detail = el("div", { class: "callout", style: "flex:1;overflow:auto" });
-    row.append(p, detail);
-    const grid = el("div", { class: "card-grid", style: "flex:1" });
-    root.append(row, grid);
-    const showDetail = (name: string) => {
-      const c = CODECS.find((x) => x.name === name);
-      const m = MODELS.find((x) => x[0] === name);
-      if (c) detail.innerHTML = `<span class="pill${c.kind === "general" ? " warn" : ""}">${c.kind}</span><h3 style="margin:6px 0 2px;font-family:var(--cond);color:var(--navy);font-size:20px">${c.name}</h3><div style="color:var(--muted);font-size:12.5px;margin-bottom:8px">${c.org} · ${c.year} · ${c.sr}</div><div style="font-family:var(--mono);font-size:12px;color:var(--navy);margin-bottom:8px">${c.hz} frames/s · ${c.kbps} kb/s</div>${c.note}`;
-      else if (m) detail.innerHTML = `<span class="pill">model</span><h3 style="margin:6px 0 2px;font-family:var(--cond);color:var(--navy);font-size:20px">${m[0]}</h3><div style="color:var(--muted);font-size:12.5px;margin-bottom:8px">${m[1]}</div>${m[2]}`;
+clap = ClapModel.from_pretrained("laion/clap-htsat-unfused")
+proc = ClapProcessor.from_pretrained("laion/clap-htsat-unfused")
+vec = clap.get_audio_features(**proc(audios=wav_48k, sampling_rate=48000, return_tensors="pt"))
+print(text, codes.shape, vec.shape)            # words, tokens, one 512-number vector`,
+  rate: () => ({ value: "0.45 – 128 kb/s", note: "HuBERT units to MP3" }),
+  mount(ctx: Ctx) {
+    let sel: Item = ITEMS[7];
+    const detail = ctx.row("book", "");
+    const show = (it: Item) => { sel = it; detail.text(`<b>${it.name}</b> · ${it.who} · ${it.year}${it.hz ? ` · ${it.hz} frames/s · ${it.kbps} kb/s · ${it.sr}` : ""}<br>${it.note}`); };
+    const chips = (list: Item[]) => {
+      const box = el("div", { class: "btns" });
+      for (const it of list) { const b = button(it.name, () => show(it), "btn"); box.append(b); }
+      return box;
     };
-    for (const [name, who, desc] of MODELS) {
-      const b = el("button", { type: "button", class: "mcard" }, el("span", { class: "tagline" }, who), el("b", {}, name), el("small", {}, desc.split(". ")[0] + "."));
-      b.addEventListener("click", () => { sel = name; grid.querySelectorAll(".mcard").forEach((x) => x.classList.toggle("is-on", x === b)); showDetail(name); });
-      grid.append(b);
-    }
-    showDetail("Mimi");
-    const S = surface(p);
-    const hits: { x: number; y: number; name: string }[] = [];
-    let hover: string | null = null;
-    S.canvas.addEventListener("pointermove", (e) => {
-      const r = S.canvas.getBoundingClientRect();
-      const mx = e.clientX - r.left, my = e.clientY - r.top;
-      hover = hits.find((h) => Math.hypot(h.x - mx, h.y - my) < 14)?.name ?? null;
-      S.canvas.style.cursor = hover ? "pointer" : "default";
-    });
-    S.canvas.addEventListener("click", () => { if (hover) { sel = hover; showDetail(hover); grid.querySelectorAll(".mcard").forEach((x) => x.classList.remove("is-on")); } });
-    const stop = loop(() => {
-      const { g, w, h } = S;
-      g.clearRect(0, 0, w, h);
-      const x0 = 46, y0 = 30, ww = w - 64, hh = h - 64;
+    ctx.row("map", "<b>Codecs and tokenizers</b> (on the map):", chips(ITEMS));
+    ctx.row("tower", "<b>Models that use them:</b>", chips(MODELS));
+    show(sel);
+    ctx.screen("head", (g, w, h) => {
+      const u = unit(h);
+      head(g, w, h, "Codecs: frames/s vs kb/s", "log scales");
+      const x0 = 12 * u, y0 = 14 * u, ww = w - 18 * u, hh = 70 * u;
       const lx = (hz: number) => x0 + ((Math.log10(hz) - Math.log10(8)) / (Math.log10(120) - Math.log10(8))) * ww;
       const ly = (k: number) => y0 + hh - ((Math.log10(k) - Math.log10(0.3)) / (Math.log10(200) - Math.log10(0.3))) * hh;
-      g.strokeStyle = PALETTE.lineSoft; g.lineWidth = 1;
-      for (const hz of [10, 12.5, 25, 50, 75, 100]) { const x = lx(hz); g.beginPath(); g.moveTo(x, y0); g.lineTo(x, y0 + hh); g.stroke(); label(g, String(hz), x, y0 + hh + 14, { align: "center", size: 10, mono: true, color: PALETTE.faint, weight: 400 }); }
-      for (const k of [0.5, 1, 2, 5, 10, 20, 50, 100]) { const y = ly(k); g.beginPath(); g.moveTo(x0, y); g.lineTo(x0 + ww, y); g.stroke(); label(g, `${k}k`, x0 - 6, y + 3, { align: "right", size: 10, mono: true, color: PALETTE.faint, weight: 400 }); }
-      label(g, "frames per second →", x0 + ww, y0 + hh + 30, { align: "right", size: 10.5, color: PALETTE.muted, weight: 600 });
-      label(g, "↑ bits per second", x0 - 6, y0 - 10, { size: 10.5, color: PALETTE.muted, weight: 600 });
-      // speech-LM sweet spot
-      g.fillStyle = "#1aa3a114"; roundRect(g, lx(9), ly(1.6), lx(30) - lx(9), ly(0.35) - ly(1.6), 10); g.fill();
-      label(g, "cheap for an LM", lx(9) + 6, ly(0.35) - 6, { size: 10, color: PALETTE.tealDeep, weight: 600 });
-      hits.length = 0;
-      for (const c of CODECS) {
-        const x = lx(c.hz), y = ly(c.kbps);
-        hits.push({ x, y, name: c.name });
-        const on = sel === c.name || hover === c.name;
-        g.fillStyle = KIND_COL[c.kind];
-        g.beginPath(); g.arc(x, y, on ? 8 : 6, 0, 7); g.fill();
-        if (on) { g.strokeStyle = PALETTE.navy; g.lineWidth = 2; g.stroke(); }
-        label(g, c.name, x + 10, y + 4, { size: 11.5, color: PALETTE.navy, weight: on ? 700 : 600 });
+      g.strokeStyle = S.grid; g.lineWidth = 0.3 * u;
+      for (const hz of [10, 25, 50, 100]) { g.beginPath(); g.moveTo(lx(hz), y0); g.lineTo(lx(hz), y0 + hh); g.stroke(); screenText(g, String(hz), lx(hz), y0 + hh + 5 * u, 3.8 * u, S.dim, "center", true); }
+      for (const k of [1, 10, 100]) { g.beginPath(); g.moveTo(x0, ly(k)); g.lineTo(x0 + ww, ly(k)); g.stroke(); screenText(g, `${k}k`, x0 - 1 * u, ly(k) + 1.4 * u, 3.8 * u, S.dim, "right", true); }
+      g.fillStyle = "#1aa3a122"; g.fillRect(lx(9), ly(1.6), lx(30) - lx(9), ly(0.35) - ly(1.6));
+      screenText(g, "cheap for a language model", lx(9) + 1 * u, ly(0.35) - 1.5 * u, 3.6 * u, S.teal);
+      // labels nudged so the two points at 75 / s and 6 kb/s don't overlap
+      const nudge: Record<string, [number, number]> = { SoundStream: [2, -2.4], EnCodec: [2, 4.6], Opus: [-2, -1.6], SpeechTokenizer: [-2, 4.2], "HuBERT units": [2, 4.6], WavTokenizer: [-2, 1.4], SNAC: [2, 1.4] };
+      for (const it of ITEMS) {
+        const x = lx(it.hz!), y = ly(it.kbps!), on = it === sel;
+        g.fillStyle = COL[it.kind]; g.beginPath(); g.arc(x, y, (on ? 1.9 : 1.3) * u, 0, 7); g.fill();
+        if (on) { g.strokeStyle = S.ink; g.lineWidth = 0.4 * u; g.stroke(); }
+        const [dx, dy] = nudge[it.name] ?? [2, 1.4];
+        screenText(g, it.name, x + (dx < 0 ? -2 : dx) * u, y + dy * u, (on ? 4.4 : 3.8) * u, on ? S.ink : S.dim, dx < 0 ? "right" : "left");
       }
+      const leg: [string, string][] = [["speech", S.teal], ["general audio", S.orange], ["semantic units", "#f3ead8"], ["classic", "#8f99b3"]];
+      leg.forEach(([t, c], i) => { g.fillStyle = c; g.fillRect(x0 + i * 22 * u, 94 * u, 2 * u, 2 * u); screenText(g, t, x0 + i * 22 * u + 3 * u, 96 * u, 3.6 * u, S.dim); });
     });
-    return () => { stop(); S.dispose(); };
+    return undefined;
   },
   run(ctx) {
-    ctx.log("codec            Hz      kb/s    tokens per minute");
-    for (const c of [...CODECS].sort((a, b) => a.kbps - b.kbps)) ctx.log(`${c.name.padEnd(15)} ${String(c.hz).padStart(5)}  ${String(c.kbps).padStart(7)}    ${Math.round(c.hz * 60).toLocaleString().padStart(6)} frames`, c.kind === "speech" ? "ok" : c.kind === "classic" ? "dim" : "info");
-    ctx.log(`Your ${ctx.audio.duration.toFixed(1)} s clip = ${Math.round(ctx.audio.duration * 12.5)} Mimi frames, ${Math.round(ctx.audio.duration * 75)} EnCodec frames.`, "head");
+    ctx.log("codec            frames/s   kb/s   frames per minute");
+    for (const it of [...ITEMS].sort((a, b) => a.kbps! - b.kbps!)) ctx.log(`${it.name.padEnd(16)} ${String(it.hz).padStart(8)} ${String(it.kbps).padStart(6)}   ${fmtN(it.hz! * 60).padStart(6)}`, it.kind === "speech" ? "ok" : it.kind === "classic" ? "dim" : "info");
+    ctx.log(`Your ${ctx.audio.duration.toFixed(1)} s sound: ${Math.round(ctx.audio.duration * 12.5)} Mimi frames, ${Math.round(ctx.audio.duration * 75)} EnCodec frames.`, "head");
+  },
+};
+
+// ---------------------------------------------------------------- 17 · your voice, end to end
+
+export const journey: Lesson = {
+  id: "journey",
+  short: "Your voice, end to end",
+  title: "Your voice, end to end",
+  chapter: "Beyond speech",
+  thumb: ["mic", "adc", "mel"],
+  focus: ORDER,
+  view: { fill: 0.94, yaw: 22 },
+  callouts: [],
+  summary: "Record a few seconds of yourself and follow the recording through every station, using the settings you chose in earlier lessons (or a preset). The table shows exactly what each station holds. Click a row to fly there, and listen to what's left at each point.",
+  steps: [
+    "Press <b>Record</b> and speak for 4 seconds, or keep a built-in sound.",
+    "Press <b>Play the journey</b>. The camera visits each station in order while your sound plays, and the cards show your sound's real numbers at that point.",
+    "Read the table from top to bottom: the shape grows (more numbers per second at the encoder) even as the detail about the sound shrinks.",
+    "Use the <b>Listen</b> buttons to hear the sound after the ADC, after the mel bands, and after the codec tokens.",
+    "Change the preset and play it again. <i>Telephone</i> shows how much an 8 kHz, 8-bit front end removes before any model sees the sound.",
+  ],
+  lost: `<p>Everything from the previous sixteen lessons, applied to your own sound. Compare the <b>Listen</b> buttons: each step after the ADC keeps less of what made the recording sound like you, and more of what was said.</p>`,
+  words: [
+    ["Shape", "How many numbers a representation has, e.g. 400 × 80 is 400 frames of 80 bands."],
+    ["Preset", "A set of pipeline settings matching a real system."],
+  ],
+  specs: Object.values(PRESETS).map((p) => [p.label, p.note] as [string, string]),
+  code: `import numpy as np, sounddevice as sd, whisper
+
+x = sd.rec(4 * 16000, samplerate=16000, channels=1)[:, 0]; sd.wait()
+print("ADC        ", x.shape)                               # (64000,)
+mel = whisper.log_mel_spectrogram(whisper.pad_or_trim(x))
+print("log-mel    ", tuple(mel.shape))                      # (80, 3000)
+m = whisper.load_model("base")
+h = m.encoder(mel[None])
+print("encoder    ", tuple(h.shape))                        # (1, 1500, 512)
+print("text       ", m.transcribe(x)["text"])`,
+  rate: (p) => ({ value: fmtBits(p.sr * p.bits), note: "at the ADC, with your settings" }),
+  mount(ctx) {
+    const setTags = (lit: string[] = []) => ctx.setTags(ORDER.filter((id) => id !== "voice").map((id, i) => ({ station: id, num: i + 1, label: stages(ctx.analysis(), ctx.pipe())[i]?.name ?? id, lit: lit.includes(id), onClick: () => ctx.go(STATION_LESSON[id]) })));
+    setTags();
+    ctx.row("mic", "<b>Record yourself</b> for 4 seconds. Every station switches to your recording.",
+      button("● Record 4 seconds", async () => { try { ctx.log("Recording…", "info"); await ctx.audio.record(4); ctx.log("Recorded.", "ok"); } catch { ctx.log("The microphone isn't available.", "warn"); } }, "btn teal big"));
+    const tour = async () => {
+      const a = ctx.analysis(), st = stages(a, ctx.pipe());
+      ctx.setTags([]);
+      await ctx.flow({
+        tour: true, per: 1.5,
+        onStation: (id, i) => {
+          const s = st[i];
+          const c: Callout = { at: `${id}.${id === "source" ? "cone" : id === "mic" ? "grille" : id === "adc" ? "chip" : id === "fft" ? "bars" : id === "mel" ? "paper" : id === "encoder" ? "layers" : id === "tokens" ? "tiles" : id === "projector" ? "mlp" : id === "lm" ? "mid" : "screen"}`, icon: "target", title: `${i + 1}. ${s.name}`, text: `Holds ${s.holds}: ${s.shape}. Lost here: ${s.gone}.`, slot: "tl", value: () => `${s.perSec} per second · ${fmtBits(s.bps)}` };
+          ctx.callouts([c]);
+          trace.querySelectorAll("tr").forEach((tr, k) => tr.classList.toggle("is-on", k === i + 1));
+        },
+      });
+      ctx.callouts([]);
+      setTags();
+      ctx.focus(ORDER, { fill: 0.94, yaw: 22 });
+    };
+    ctx.row("play", "<b>Play the journey.</b> The camera visits every station while the sound plays.", button("▶ Play the journey", () => void tour(), "btn primary big"));
+    ctx.row("knob", "<b>Presets</b> set every station at once to match a real system.",
+      segmented("Preset", Object.entries(PRESETS).map(([k, p]) => [k, p.label] as [string, string]), "whisper", (v) => ctx.setPipe(PRESETS[v].pipe)));
+    const trace = el("table", { class: "table" });
+    const render = () => {
+      const a = ctx.analysis(), st = stages(a, ctx.pipe());
+      trace.innerHTML = `<tr><th>Station</th><th>Shape</th><th>Per second</th><th>Bits/s</th></tr>`;
+      st.forEach((s) => {
+        const tr = el("tr", { "data-click": "1" });
+        tr.innerHTML = `<td>${s.name}</td><td>${s.shape}</td><td>${s.perSec}</td><td>${fmtBits(s.bps)}</td>`;
+        tr.addEventListener("click", () => ctx.focus([s.station], { fill: 0.42 }));
+        trace.append(tr);
+      });
+      setTags();
+    };
+    render();
+    ctx.onChange(render);
+    ctx.row("grid", "<b>What each station holds</b> for the current sound and settings. Click a row to fly to that station.", trace);
+    const p = () => ctx.pipe();
+    ctx.row("ear", "<b>Listen at each stage.</b>",
+      el("div", { class: "btns" },
+        button("Original", () => ctx.audio.playClip(), "btn"),
+        button("After ADC", () => { const a = ctx.analysis(); ctx.audio.playSignal([quantize(monoAt(a.clip, p().sr), p().bits)], p().sr); }, "btn"),
+        button("After mel bands", () => { const a = ctx.analysis(); setTimeout(() => ctx.audio.playSignal([melOnly(a.x, p().sr, p().nMels, a.clip.id)], p().sr), 30); }, "btn"),
+        button("After tokens", () => setTimeout(() => ctx.audio.playSignal([codecDecode(ctx.analysis(), 8)], 16000), 30), "btn")));
+    const sDur = ctx.stat("Length"), sS = ctx.stat("Samples"), sM = ctx.stat("Mel numbers"), sL = ctx.stat("LM tokens");
+    const stats = () => {
+      const a = ctx.analysis();
+      sDur.set(`${(a.clip.channels[0].length / a.clip.sr).toFixed(1)} s`);
+      sS.set(fmtN(a.x.length));
+      sM.set(fmtN(a.mel.frames.length * p().nMels));
+      sL.set(fmtN(Math.ceil(a.enc.T / p().pool)));
+    };
+    stats();
+    ctx.onChange(stats);
+    return () => ctx.setTags([]);
+  },
+  run(ctx) {
+    const a = ctx.analysis(), p = ctx.pipe();
+    ctx.log(`"${a.clip.name}" · ${p.sr / 1000} kHz · ${p.bits}-bit · ${p.winMs}/${p.hopMs} ms · ${p.nMels} bands · stride ${p.encStride} · pool ${p.pool}`, "head");
+    for (const s of stages(a, p)) ctx.log(`${s.name.padEnd(15)} ${s.shape.padEnd(28)} ${s.perSec.padEnd(16)} ${fmtBits(s.bps)}`);
+    ctx.log("Bits per second rise at the encoder (more numbers) while detail about the sound keeps falling.", "ok");
   },
 };
