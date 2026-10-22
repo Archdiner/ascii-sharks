@@ -36,6 +36,7 @@ export class Screen {
     const standH = opts.stand ?? 0.5;
     head.position.y = standH + h / 2 + 0.08;
     this.group.add(head);
+    this.group.userData.part = "screen";
     if (standH > 0) {
       const neck = part(new THREE.BoxGeometry(0.14, standH + 0.1, 0.1), C.navy);
       neck.position.set(0, (standH + 0.1) / 2, -0.14);

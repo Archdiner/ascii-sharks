@@ -39,6 +39,8 @@ The page is an illustrated 3D machine with eleven stations: speaker → micropho
 | 16 | Beyond speech | Where the field is | map of codecs and tokenizers, the models that use them, open problems |
 | 17 | Beyond speech | Your voice, end to end | presets, a stage-by-stage table for your recording, and listening at each stage |
 
+**Every station works from any lesson.** Click any part of the machine to open its panel: a live monitor, what the station does, its controls (play or record, sample rate and bits, frame length, mel bands, stride, codebooks, pooling, temperature, generate new audio) and a link to its lesson. Every panel, label card and flyout has a × to close it; **Labels** and **Monitor** in the view bar bring them back, and the choice is remembered.
+
 Settings changed in one lesson (sample rate, bit depth, frame length, mel bands, stride, pooling) carry forward to every later station and to the end-to-end view.
 
 Each lesson has four tabs (**Overview** with the controls, **How it works**, **What's lost**, **Words & specs**) and a **Try it yourself** snippet in Python whose ▶ button runs the same computation in the browser on the current sound.

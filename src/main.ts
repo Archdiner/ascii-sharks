@@ -9,6 +9,7 @@ import { World } from "./scene/world";
 import { buildAll, ORDER } from "./scene/stations";
 import { bus } from "./scene/bus";
 import type { Draw } from "./scene/screen";
+import { COMPONENTS, type CompApi } from "./components";
 import { getPipe, setPipe, onPipe, describe } from "./pipeline";
 import { analyse, feedScene, sharedBooks, labelLogits, type Analysis } from "./analysis";
 import type { Ctx, Lesson, LogKind, Callout } from "./types";
@@ -69,12 +70,18 @@ app.innerHTML = `
   <main class="stage" id="stage">
     <div class="world" id="world"></div>
     <div class="viewbar" id="viewbar" role="toolbar" aria-label="Sound and view"></div>
-    <section class="inspector" id="inspector" hidden>
-      <header><span id="insp-title">Monitor</span><button class="insp-btn" id="insp-big" title="Enlarge" aria-label="Enlarge">${icon("screen")}</button></header>
+    <section class="inspector" id="inspector" hidden aria-label="Component">
+      <header>
+        <span class="insp-ic" id="insp-ic"></span>
+        <div class="insp-head"><b id="insp-title">Monitor</b><small id="insp-status"></small></div>
+        <button class="insp-btn" id="insp-big" title="Enlarge" aria-label="Enlarge">${icon("screen")}</button>
+        <button class="insp-btn" id="insp-close" title="Close" aria-label="Close">${icon("close")}</button>
+      </header>
       <canvas id="insp-canvas"></canvas>
+      <div class="insp-body" id="insp-body"></div>
     </section>
     <div class="screen-view" id="screen-view" hidden>
-      <header><b id="sv-title">Screen</b><button class="sv-close" id="sv-close" aria-label="Close">${icon("cut")}</button></header>
+      <header><b id="sv-title">Screen</b><button class="sv-close" id="sv-close" aria-label="Close" title="Close">${icon("close")}</button></header>
       <canvas id="sv-canvas"></canvas>
     </div>
   </main>
@@ -216,7 +223,6 @@ const ctx: Ctx = {
     sc.draw = draw;
     touched.add(`${sid}.${key}`);
     if (draw && opts.primary !== false && (!primary || opts.primary)) primary = { station: sid, key, draw };
-    $("sv-btn")?.toggleAttribute("disabled", !primary);
   },
   click(sid, fn, hint) {
     const st = world.stations.get(sid);
@@ -284,6 +290,7 @@ function show(l: Lesson) {
   bus.glow.clear();
   bus.flowing.clear();
   primary = null;
+  panelFor = null;
   closeScreen();
   insp.hidden = true;
   changeSubs = [];
@@ -306,10 +313,9 @@ function show(l: Lesson) {
   setRunState("idle");
   log(l.intro ? "Press ▶ to see the whole pipeline's numbers for the current sound." : `Press ▶ to run this step on "${audio.clip.name}".`, "dim");
   unmount = l.mount(ctx);
-  $("sv-btn")?.toggleAttribute("disabled", !primary);
-  showInspector();
-  // with the inspector docked on the right, slide the machine left so it stays in view
-  if (primary) resetView();
+  showPanel();
+  // with the panel docked on the right, slide the machine left so it stays in view
+  if (!insp.hidden) resetView();
   renderLessonList();
   document.title = l.intro ? "How Computers Listen" : `${l.title} · How Computers Listen`;
 }
@@ -391,19 +397,22 @@ $("strip-next").addEventListener("click", () => $("lesson-list").scrollBy({ left
 const sv = $("screen-view"), svCanvas = $<HTMLCanvasElement>("sv-canvas");
 let svStop: (() => void) | null = null;
 function openScreen() {
-  if (!primary) return;
+  const d0 = panelDraw();
+  if (!d0) return;
+  svStop?.();
   sv.hidden = false;
-  $("sv-title").textContent = `${world.stations.get(primary.station)?.name ?? ""} screen`;
+  $("sv-title").textContent = $("insp-title").textContent || "Monitor";
   const g = svCanvas.getContext("2d")!;
   let alive = true;
   const tick = (t: number) => {
-    if (!alive || !primary) return;
+    const draw = panelDraw();
+    if (!alive || !draw) return;
     const r = svCanvas.getBoundingClientRect();
     const dpr = Math.min(2, devicePixelRatio || 1);
     const w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
     if (svCanvas.width !== w || svCanvas.height !== h) { svCanvas.width = w; svCanvas.height = h; }
     g.save();
-    primary.draw(g, w, h, t / 1000);
+    draw(g, w, h, t / 1000);
     g.restore();
     requestAnimationFrame(tick);
   };
@@ -413,20 +422,87 @@ function openScreen() {
 function closeScreen() { sv.hidden = true; svStop?.(); svStop = null; }
 $("sv-close").addEventListener("click", closeScreen);
 
-// ---------------------------------------------------------------- inspector: the lesson's main monitor, drawn large
+// ---------------------------------------------------------------- panel: the lesson's monitor, or any component you click
 
 const insp = $("inspector"), inspCanvas = $<HTMLCanvasElement>("insp-canvas");
-function showInspector() {
-  if (!primary) { insp.hidden = true; callouts.link(null, insp); return; }
-  const st = world.stations.get(primary.station)!;
-  const sc = st.screens[primary.key];
-  insp.hidden = false;
-  insp.style.setProperty("--aspect", String(sc.canvas.width / sc.canvas.height));
-  $("insp-title").textContent = `${st.name} monitor`;
-  callouts.link(st.anchors.screen ?? st.group, insp);
+const pref = (k: string, d: boolean) => { try { const v = localStorage.getItem(k); return v === null ? d : v === "1"; } catch { return d; } };
+const setPref = (k: string, v: boolean) => { try { localStorage.setItem(k, v ? "1" : "0"); } catch { /* private mode */ } };
+/** station shown in the panel when a component was clicked; null shows the lesson's own monitor */
+let panelFor: string | null = null;
+let panelOpen = pref("hcl-monitor", true);
+let labelsOn = pref("hcl-labels", true);
+const compDraws = new Map<string, Draw>();
+const compApi: CompApi = { audio, pipe: getPipe, setPipe, analysis: () => ctx.analysis(), log, flow: () => flow({ per: 0.75 }) };
+
+function panelDraw(): Draw | null {
+  if (panelFor) {
+    const st = world.stations.get(panelFor)!, comp = COMPONENTS[panelFor], sc = st.screens.main;
+    if (sc?.draw) return sc.draw;
+    if (comp?.draw) { if (!compDraws.has(panelFor)) compDraws.set(panelFor, comp.draw(compApi)); return compDraws.get(panelFor)!; }
+    return sc ? sc.idle : null;
+  }
+  return primary?.draw ?? null;
 }
+
+function showPanel() {
+  const id = panelFor ?? primary?.station ?? null;
+  const visible = !!id && (panelFor !== null || panelOpen);
+  insp.hidden = !visible;
+  $("mon-btn")?.classList.toggle("is-on", visible);
+  if (!visible || !id) { callouts.link(null, insp); return; }
+  const st = world.stations.get(id)!;
+  const sc = st.screens[panelFor ? "main" : primary!.key];
+  // a component panel also holds controls, so its monitor is drawn a little shorter
+  const aspect = sc ? sc.canvas.width / sc.canvas.height : 1.7;
+  insp.style.setProperty("--aspect", String(panelFor ? Math.max(aspect, 2.3) : aspect));
+  const body = $("insp-body");
+  body.innerHTML = "";
+  if (panelFor) {
+    const comp = COMPONENTS[panelFor];
+    $("insp-ic").innerHTML = icon(comp.icon);
+    $("insp-title").textContent = comp.name;
+    body.append(el("p", { class: "insp-what" }, comp.what), ...comp.controls(compApi));
+    const foot = el("div", { class: "insp-foot" });
+    const lessonBtn = el("button", { type: "button", class: "btn" }, `How it works →`);
+    lessonBtn.addEventListener("click", () => go(comp.lesson));
+    foot.append(lessonBtn);
+    if (primary) { const back = el("button", { type: "button", class: "btn-ghost" }, "← This lesson's monitor"); back.addEventListener("click", () => { panelFor = null; showPanel(); resetView(); }); foot.append(back); }
+    body.append(foot);
+  } else {
+    $("insp-ic").innerHTML = icon("screen");
+    $("insp-title").textContent = `${st.name} monitor`;
+    $("insp-status").textContent = "this lesson's live view";
+  }
+  callouts.link(st.anchors.screen ?? st.anchors.tag ?? st.group, insp);
+}
+
+function openComponent(id: string) {
+  panelFor = id;
+  showPanel();
+  if (window.innerWidth > 1100) world.focus([id], { fill: 0.5, offset: [-0.15, 0.03] });
+}
+
+/** × always closes the panel. Closing the lesson's own monitor is remembered; the Monitor button brings it back. */
+function closePanel() {
+  if (panelFor === null) { panelOpen = false; setPref("hcl-monitor", false); }
+  panelFor = null;
+  insp.hidden = true;
+  $("mon-btn")?.classList.remove("is-on");
+  callouts.link(null, insp);
+  resetView();
+}
+$("insp-close").addEventListener("click", closePanel);
+$("insp-big").addEventListener("click", () => openScreen());
+
+world.fallbackClick = (st) => { if (COMPONENTS[st.id]) openComponent(st.id); };
+world.fallbackHint = (st) => (COMPONENTS[st.id] ? `${COMPONENTS[st.id].name}: click to use it` : null);
+
+let statusAt = 0;
 world.onTick((t) => {
-  if (insp.hidden || !primary) return;
+  if (insp.hidden) return;
+  const draw = panelDraw();
+  if (panelFor && t - statusAt > 0.2) { statusAt = t; $("insp-status").textContent = COMPONENTS[panelFor].status(compApi); }
+  if (!draw) return;
   const r = inspCanvas.getBoundingClientRect();
   const dpr = Math.min(2, devicePixelRatio || 1);
   const w = Math.round(r.width * dpr), h = Math.round(r.height * dpr);
@@ -434,10 +510,25 @@ world.onTick((t) => {
   if (inspCanvas.width !== w || inspCanvas.height !== h) { inspCanvas.width = w; inspCanvas.height = h; }
   const g = inspCanvas.getContext("2d")!;
   g.save();
-  primary.draw(g, w, h, t);
+  draw(g, w, h, t);
   g.restore();
 });
-$("insp-big").addEventListener("click", () => openScreen());
+
+function toggleMonitor() {
+  if (!insp.hidden) { closePanel(); return; }
+  panelOpen = true; setPref("hcl-monitor", true);
+  panelFor = primary ? null : panelFor;
+  showPanel();
+  resetView();
+}
+function toggleLabels() {
+  labelsOn = !labelsOn;
+  setPref("hcl-labels", labelsOn);
+  stage.classList.toggle("no-labels", !labelsOn);
+  if (labelsOn) callouts.restore();
+  $("lbl-btn")?.classList.toggle("is-on", labelsOn);
+}
+stage.classList.toggle("no-labels", !labelsOn);
 
 // ---------------------------------------------------------------- view bar: sound + camera
 
@@ -481,12 +572,15 @@ function renderViewbar() {
     vb("filter", "", () => world.zoomBy(0.8), "", "Zoom out (−)"),
     vb("target", "", () => resetView(), "", "Reset view (0)"),
     vb("grid", "", () => world.zoomBy(1.25), "", "Zoom in (+)"),
-    (() => { const b = vb("screen", "", openScreen, "", "Enlarge this lesson's screen"); b.id = "sv-btn"; if (!primary) b.setAttribute("disabled", ""); return b; })(),
+    el("span", { class: "vb-sep" }),
+    (() => { const b = vb("text", "Labels", toggleLabels, labelsOn ? "is-on" : "", "Show or hide the label cards"); b.id = "lbl-btn"; return b; })(),
+    (() => { const b = vb("screen", "Monitor", toggleMonitor, !insp.hidden ? "is-on" : "", "Show or hide the monitor panel"); b.id = "mon-btn"; return b; })(),
   );
 }
 function resetView() {
   const l = current;
-  const docked = primary && window.innerWidth > 1100;
+  const docked = !insp.hidden && !panelFor && window.innerWidth > 1100;
+  if (panelFor && window.innerWidth > 1100) { world.focus([panelFor], { fill: 0.5, offset: [-0.15, 0.03] }); return; }
   if (docked) world.focus(l.focus, { ...l.view, fill: (l.view?.fill ?? 0.62) * 0.86, offset: [(l.view?.offset?.[0] ?? 0) - 0.15, l.view?.offset?.[1] ?? 0] });
   else world.focus(l.focus, l.view);
 }
@@ -530,6 +624,9 @@ function openFlyout(kind: string | null, anchor?: HTMLElement) {
   if (!kind || flyout.dataset.kind === kind) { flyout.classList.remove("is-open"); flyout.dataset.kind = ""; return; }
   flyout.dataset.kind = kind;
   flyout.innerHTML = "";
+  const x = el("button", { type: "button", class: "fly-x", title: "Close", "aria-label": "Close", html: icon("close") });
+  x.addEventListener("click", () => openFlyout(null));
+  flyout.append(x);
   if (kind === "lessons") {
     flyout.append(el("h3", {}, "Lessons"));
     let chap = "";
@@ -584,7 +681,7 @@ document.addEventListener("keydown", (e) => {
   else if (k === "+" || k === "=") world.zoomBy(1.25);
   else if (k === "-") world.zoomBy(0.8);
   else if (k === "0") resetView();
-  else if (k === "Escape") { openFlyout(null); closeScreen(); }
+  else if (k === "Escape") { openFlyout(null); if (!sv.hidden) closeScreen(); else if (!insp.hidden) closePanel(); }
 });
 
 // ---------------------------------------------------------------- boot: build data and pictures behind the loader

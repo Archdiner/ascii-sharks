@@ -196,7 +196,7 @@ print(logmel.shape)                                 # (80, frames)`,
     const { audio } = ctx;
     const nm = () => ctx.pipe().nMels;
     const mS = slider({ label: "Bands", min: 16, max: 128, step: 8, value: nm(), onInput: (v) => ctx.setPipe({ nMels: v }) });
-    ctx.click("mel", (part) => { if (part !== "knob") return; const next = MELS.find((m) => m > nm()) ?? MELS[0]; ctx.setPipe({ nMels: next }); mS.set(next); }, (part) => (part === "knob" ? "Click to change the number of bands" : part === "paper" ? "The printed spectrogram of the current sound" : null));
+    ctx.click("mel", (part) => { if (part !== "knob") return; const next = MELS.find((m) => m > nm()) ?? MELS[0]; ctx.setPipe({ nMels: next }); mS.set(next); }, (part) => (part === "knob" ? "Click to change the number of bands" : null));
     ctx.row("knob", "<b>Number of bands.</b> Turn the dial on the printer, or drag. Fewer bands means a blurrier picture with fewer numbers.", mS);
     ctx.row("play", "<b>Watch it print.</b> Press play in the bar below: the paper prints the sound as it plays.");
     ctx.row("ear", "<b>Hear only the bands.</b> Rebuild sound from the band energies alone, at the current settings. Then try 16 bands.",

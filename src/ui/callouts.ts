@@ -40,7 +40,7 @@ export class Callouts {
     stage.append(this.svg, this.layer, this.tip);
     world.onTick(() => this.tick());
     world.onHover = (h) => {
-      const text = h ? h.station.hint?.(h.part) : null;
+      const text = h ? this.world.hintFor(h.station, h.part) : null;
       this.tip.classList.toggle("is-on", !!text);
       if (text && h) {
         this.tip.textContent = text;
@@ -49,7 +49,19 @@ export class Callouts {
     };
   }
 
+  private lastList: Placed[] = [];
+
+  /** bring back cards the reader closed */
+  restore() { this.set(this.lastList); }
+
+  private dismiss(card: HTMLElement) {
+    this.items = this.items.filter((i) => i.card !== card);
+    card.classList.remove("is-in");
+    setTimeout(() => card.remove(), 200);
+  }
+
   set(list: Placed[]) {
+    this.lastList = list;
     this.layer.querySelectorAll(".callout").forEach((n) => n.remove());
     this.items = [];
     this.list.innerHTML = "";
@@ -66,9 +78,11 @@ export class Callouts {
       }
       used.add(slot);
       const val = p.value ? el("b", { class: "co-val" }, "") : null;
+      const close = el("button", { type: "button", class: "co-x", title: "Close", "aria-label": `Close ${p.title}`, html: icon("close") });
       const card = el("div", { class: `callout slot-${slot}` },
         el("span", { class: "co-ic", html: icon(p.icon) }),
-        el("div", { class: "co-body" }, el("h4", {}, p.title), val, el("p", {}, p.text)));
+        el("div", { class: "co-body" }, el("h4", {}, p.title), val, el("p", {}, p.text)), close);
+      close.addEventListener("click", () => this.dismiss(card));
       this.layer.append(card);
       this.items.push({ p, card, val, slot });
       this.list.append(el("li", {}, el("span", { class: "co-ic", html: icon(p.icon) }), el("div", {}, el("b", {}, p.title), el("p", {}, p.text))));
@@ -98,9 +112,14 @@ export class Callouts {
     const now = performance.now();
     const refresh = now - this.last > 120;
     if (refresh) this.last = now;
-    for (const { p, card, val, slot } of this.items) {
+    const labelsOff = this.stage.classList.contains("no-labels");
+    for (const { p, card, val, slot } of labelsOff ? [] : this.items) {
       if (refresh && val && p.value) val.textContent = p.value();
       const a = this.world.project(p.anchor);
+      // an anchor that has left the stage gets no leader rather than a line across the page
+      const offStage = a.x < 0 || a.y < 0 || a.x > sr.width || a.y > sr.height;
+      card.classList.toggle("is-unlinked", offStage);
+      if (offStage) continue;
       const cr = card.getBoundingClientRect();
       const cx = cr.left - sr.left, cy = cr.top - sr.top;
       let sx: number, sy: number, ex: number, ey: number;
@@ -115,8 +134,9 @@ export class Callouts {
       }
       paths += `<path d="M${sx},${sy} L${ex},${ey} L${a.x},${a.y}" class="ld"/><circle cx="${sx}" cy="${sy}" r="3.2" class="ld-end"/><circle cx="${a.x}" cy="${a.y}" r="5" class="ld-dot"/><circle cx="${a.x}" cy="${a.y}" r="2" class="ld-core"/>`;
     }
-    if (this.linked && !this.linked.el.hidden) {
-      const a = this.world.project(this.linked.anchor);
+    const la = this.linked && !this.linked.el.hidden ? this.world.project(this.linked.anchor) : null;
+    if (this.linked && la && la.x >= 0 && la.y >= 0 && la.x <= sr.width && la.y <= sr.height) {
+      const a = la;
       const r = this.linked.el.getBoundingClientRect();
       const sx = r.left - sr.left, sy = r.top - sr.top + 22;
       paths += `<path d="M${sx},${sy} L${sx - 16},${sy} L${a.x},${a.y}" class="ld ld-insp"/><circle cx="${sx}" cy="${sy}" r="3.2" class="ld-end"/><circle cx="${a.x}" cy="${a.y}" r="5" class="ld-dot"/><circle cx="${a.x}" cy="${a.y}" r="2" class="ld-core"/>`;

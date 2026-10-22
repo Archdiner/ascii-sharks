@@ -41,6 +41,9 @@ export class World {
   private t0 = performance.now();
   private hover: { station: Station; part: string } | null = null;
   onHover: ((h: { station: Station; part: string; x: number; y: number } | null) => void) | null = null;
+  /** what happens when a part the lesson doesn't handle is clicked (opens the component panel) */
+  fallbackClick: ((station: Station, part: string) => void) | null = null;
+  fallbackHint: ((station: Station, part: string) => string | null) | null = null;
   /** focused station ids (dims the rest) */
   private focusIds: string[] = [];
   private frameNo = 0;
@@ -174,15 +177,21 @@ export class World {
     const r = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(((cx - r.left) / r.width) * 2 - 1, -((cy - r.top) / r.height) * 2 + 1);
     this.ray.setFromCamera(ndc, this.camera);
+    // every part of every station can be clicked; named parts report their name, the rest "body"
     const objs: THREE.Object3D[] = [];
-    this.stations.forEach((s) => { if (s.onClick) objs.push(...s.pick); });
-    const hit = this.ray.intersectObjects(objs, true)[0];
+    this.stations.forEach((s) => objs.push(s.group));
+    const hit = this.ray.intersectObjects(objs, true).find((h) => h.object.visible && h.object.userData.station);
     if (!hit) return null;
     let o: THREE.Object3D | null = hit.object;
     while (o && !o.userData.part) o = o.parent;
     const st = this.stations.get(hit.object.userData.station);
-    return st && o ? { station: st, part: o.userData.part as string } : null;
+    return st ? { station: st, part: (o?.userData.part as string) ?? "body" } : null;
   }
+
+  /** the lesson handles a part if it registered a hint for it; otherwise the fallback does */
+  private handles(st: Station, part: string) { return !!(st.onClick && st.hint?.(part)); }
+
+  hintFor(st: Station, part: string) { return this.handles(st, part) ? st.hint!(part) : this.fallbackHint?.(st, part) ?? null; }
 
   private bindInput() {
     const el = this.renderer.domElement;
@@ -209,7 +218,10 @@ export class World {
       this.onHover?.(h ? { ...h, x: e.clientX - r.left, y: e.clientY - r.top } : null);
     });
     el.addEventListener("pointerup", (e) => {
-      if (drag && !drag.moved) { const h = this.pickAt(e.clientX, e.clientY); h?.station.onClick?.(h.part); }
+      if (drag && !drag.moved) {
+        const h = this.pickAt(e.clientX, e.clientY);
+        if (h) { if (this.handles(h.station, h.part)) h.station.onClick!(h.part); else this.fallbackClick?.(h.station, h.part); }
+      }
       drag = null;
     });
     el.addEventListener("pointerleave", () => this.onHover?.(null));

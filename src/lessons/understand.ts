@@ -203,6 +203,28 @@ function bigram() {
   });
 }
 
+/**
+ * Write new codec frames one at a time from the next-code model, starting at the clip's first frame.
+ * Codebooks 2–8 are borrowed from a real frame with the same first code (a crude stand-in for
+ * Moshi's depth transformer). Returns the first-codebook sequence and a lazy decoder.
+ */
+export function generateAudio(clip: import("../audio/engine").Clip, temp: number, topP: number, r: () => number, frames = 38) {
+  const { counts, columns } = bigram();
+  const c = codecCodes(clip);
+  let cur = c.codes[0][0];
+  const gen = [cur];
+  for (let i = 1; i < frames; i++) {
+    const p = softmax(Array.from(counts[cur], (v) => Math.log(v)), temp), keep = nucleus(p, topP);
+    const z = [...keep].reduce((a, j) => a + p[j], 0);
+    let u = r() * z;
+    for (const j of keep) { u -= p[j]; if (u <= 0) { cur = j; break; } }
+    gen.push(cur);
+  }
+  const cols = gen.map((g) => { const opts = columns[g]; return opts.length ? opts[Math.floor(r() * opts.length)] : [g, 0, 0, 0, 0, 0, 0, 0]; });
+  const fake = { frames: cols.map(() => new Float32Array(80)), codes: Array.from({ length: 8 }, (_, s) => cols.map((col) => col[s])), recon: [] as Float32Array<ArrayBuffer>[] };
+  return { codes: gen, columns: cols, audio: () => decodeFrames(cols.map((_, i) => partial(fake, i, 8))) };
+}
+
 export const headLesson: Lesson = {
   id: "head",
   short: "LM head",
@@ -278,23 +300,10 @@ print(tokenizer.decode(sample(logits)))`,
       ctx.log(`picked "${names[pick]}" (p = ${p[pick].toFixed(3)})`, "dim");
     }, "btn primary");
     const genBtn = button("▶ Generate 3 s and hear it", () => {
-      const { counts, columns } = bigram();
-      const c = codecCodes(ctx.audio.clip);
-      let cur = c.codes[0][0];
-      gen = [cur];
-      for (let i = 1; i < 38; i++) {
-        const p = softmax(Array.from(counts[cur], (v) => Math.log(v)), temp), keep = nucleus(p, topP);
-        const z = [...keep].reduce((a, j) => a + p[j], 0);
-        let u = r() * z;
-        for (const j of keep) { u -= p[j]; if (u <= 0) { cur = j; break; } }
-        gen.push(cur);
-      }
-      // fill codebooks 2–8 by borrowing a real column that starts with the same first code
-      const cols = gen.map((g) => { const opts = columns[g]; return opts.length ? opts[Math.floor(r() * opts.length)] : [g, 0, 0, 0, 0, 0, 0, 0]; });
-      const fake = { frames: cols.map(() => new Float32Array(80)), codes: Array.from({ length: 8 }, (_, s) => cols.map((col) => col[s])), recon: [] as Float32Array<ArrayBuffer>[] };
-      const frames = cols.map((_, i) => partial(fake, i, 8));
+      const g2 = generateAudio(ctx.audio.clip, temp, topP, r);
+      gen = g2.codes;
       ctx.log(`generated ${gen.length} frames (codebook 1): ${gen.slice(0, 16).join(" ")} …`, "dim");
-      setTimeout(() => ctx.audio.playSignal([decodeFrames(frames)], 16000), 30);
+      setTimeout(() => ctx.audio.playSignal([g2.audio()], 16000), 30);
     }, "btn primary");
     const actions = el("div", { class: "btns" }, sampleBtn);
     ctx.row("play", "<b>Pick.</b> In labels mode the model names the sound. In audio mode it writes 3 seconds of new codes, starting from your sound's first frame, and plays them.", actions);

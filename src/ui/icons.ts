@@ -37,6 +37,8 @@ const P: Record<string, string> = {
   bolt: '<path d="M13 2 4 14h7l-1 8 9-12h-7z"/>',
   ruler: '<rect x="2.5" y="8" width="19" height="8" rx="1"/><path d="M6 8v3M10 8v4M14 8v3M18 8v4"/>',
   people: '<circle cx="8" cy="8" r="3"/><circle cx="16.5" cy="9" r="2.5"/><path d="M2.5 20a5.5 5.5 0 0 1 11 0M13 20a4 4 0 0 1 8 0"/>',
+  close: '<path d="M6 6l12 12M18 6 6 18"/>',
+  eye: '<path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z"/><circle cx="12" cy="12" r="3"/>',
   map: '<path d="m3 6 6-3 6 3 6-3v15l-6 3-6-3-6 3z"/><path d="M9 3v15M15 6v15"/>',
 };
 
